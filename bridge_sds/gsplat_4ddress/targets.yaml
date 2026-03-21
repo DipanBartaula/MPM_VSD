@@ -1,0 +1,115 @@
+# =============================================================================
+# bridge_sds/gsplat_4ddress/targets.yaml
+#
+# 10-12 4D-DRESS (subject, take, frame) targets for gsplat reconstruction.
+# Each entry produces one saved .ply Gaussian Splat model.
+#
+# Dataset root on Clariden:
+#   /iopsstor/scratch/cscs/dbartaula/4D-Dress
+#
+# Directory pattern:
+#   <root>/4D-DRESS/<subject:05d>_Inner/Inner/Take<take>/
+# =============================================================================
+
+dataset_root: /iopsstor/scratch/cscs/dbartaula/4D-Dress
+
+# Output directory (relative to where scripts are run, or absolute)
+output_dir: ./output/gsplat_4ddress
+
+# Gaussian Splatting training hyper-parameters
+train:
+  iterations:      7000    # 7k iters is usually enough for single-frame
+  sh_degree:       3
+  white_background: true
+  downscale_ratio:  1.0    # set >1 to downsample images (e.g. 2.0 = half res)
+  # Densification schedule
+  densify_from_iter:   500
+  densify_until_iter:  5000
+  densify_grad_thresh: 0.0002
+  opacity_reset_interval: 3000
+  min_opacity:     0.005
+  max_screen_size: 20
+  percent_dense:   0.01
+  # Learning rates
+  position_lr_init:       0.00016
+  position_lr_final:      0.0000016
+  position_lr_delay_mult: 0.01
+  position_lr_max_steps:  7000
+  feature_lr:     0.0025
+  opacity_lr:     0.05
+  scaling_lr:     0.005
+  rotation_lr:    0.001
+  # Loss
+  lambda_dssim:   0.2       # weight for SSIM term;  loss = (1-λ)*L1 + λ*(1-SSIM)
+  # Logging
+  log_interval:   500
+  save_interval:  2000
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Targets: 12 reconstructions (4 subjects × 3 frames each)
+# Frame indices are as found in the 4D-DRESS Capture folder.
+# ─────────────────────────────────────────────────────────────────────────────
+targets:
+  # Subject 170 ── three different poses
+  - name: s170_t1_f021
+    subject: 170
+    take:    1
+    frame:   21
+
+  - name: s170_t1_f060
+    subject: 170
+    take:    1
+    frame:   60
+
+  - name: s170_t1_f100
+    subject: 170
+    take:    1
+    frame:   100
+
+  # Subject 185
+  - name: s185_t1_f021
+    subject: 185
+    take:    1
+    frame:   21
+
+  - name: s185_t1_f060
+    subject: 185
+    take:    1
+    frame:   60
+
+  - name: s185_t1_f100
+    subject: 185
+    take:    1
+    frame:   100
+
+  # Subject 190 (Take1 not available in current 4D-DRESS mirror)
+  - name: s190_t2_f021
+    subject: 190
+    take:    2
+    frame:   21
+
+  - name: s190_t2_f060
+    subject: 190
+    take:    2
+    frame:   60
+
+  - name: s190_t2_f100
+    subject: 190
+    take:    2
+    frame:   100
+
+  # Subject 191 (Take1 not available in current 4D-DRESS mirror)
+  - name: s191_t2_f021
+    subject: 191
+    take:    2
+    frame:   21
+
+  - name: s191_t2_f060
+    subject: 191
+    take:    2
+    frame:   60
+
+  - name: s191_t2_f100
+    subject: 191
+    take:    2
+    frame:   100

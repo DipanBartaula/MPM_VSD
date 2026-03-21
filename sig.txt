@@ -1,0 +1,1 @@
+(self, hidden_states: torch.Tensor, timestep: torch.LongTensor, encoder_hidden_states: torch.Tensor, encoder_hidden_states_image: Optional[torch.Tensor] = None, return_dict: bool = True, attention_kwargs: Optional[Dict[str, Any]] = None) -> Union[torch.Tensor, Dict[str, torch.Tensor]]

@@ -1,0 +1,90 @@
+# =============================================================================
+# bridge_sds/configs/sds_phi.yaml
+# Default hyper-parameters for SDS-guided physics parameter optimisation.
+# All values can be overridden via CLI flags in optimize_phi.py.
+# =============================================================================
+
+# ── Physics parameter search space ───────────────────────────────────────────
+phi:
+  D:                            # Cloth density
+    init:  1.0
+    min:   0.1
+    max:   3.0
+    lr:    1.0e-2               # Used in backprop mode only
+  E:                            # Young's modulus (stored ×100 in MPMAvatar convention)
+    init:  100.0
+    min:   0.5
+    max:   20.0
+    lr:    3.0e-1
+  H:                            # Height / initial-cloth-scale factor
+    init:  1.0
+    min:   0.8
+    max:   1.2
+    lr:    1.0e-2
+
+# ── Fixed MPM material parameters (not optimised) ────────────────────────────
+mpm_fixed:
+  nu:     0.3                   # Poisson's ratio
+  gamma:  500.0                 # Cloth-specific shear stiffness
+  kappa:  500.0                 # Cloth-specific bulk stiffness
+  mesh_friction_coeff: 0.5      # Body–cloth friction
+  friction_angle:      40.0     # Friction angle (degrees)
+
+# ── MPM simulation settings ──────────────────────────────────────────────────
+mpm:
+  substep:   400                # substeps per 1/25 s frame (higher = more accurate)
+  grid_size: 200                # MPM Cartesian grid resolution (n³)
+  fps:       25.0               # physics frames per second
+
+# ── Clip sampling per iteration ──────────────────────────────────────────────
+clip:
+  frame_num:    25              # frames per optimisation clip (T)
+  jitter_range: 5               # randomly offset clip start by ±jitter_range
+
+# ── Gaussian rendering ────────────────────────────────────────────────────────
+render:
+  width:         512            # must match the appearance-trained model
+  height:        512
+  bg_white:      true
+  montage:       false          # tile K views into one frame for multi-view SDS
+  montage_n_views: 4            # number of cameras for montage (must be ≤ available)
+
+# ── Score Distillation Sampling (Phase3 / Wan I2V) ───────────────────────────
+sds:
+  enabled:           true       # set false to run only physical regularisers
+  target_resolution: 128        # resize frames before scoring (Phase3 input size)
+  timestep_min:      50         # min DDPM timestep for noise schedule
+  timestep_max:      950        # max DDPM timestep
+  guidance_scale:    7.5        # classifier-free guidance weight
+  use_amp:           true       # FP16 auto mixed-precision for scorer
+
+# ── Loss weights ──────────────────────────────────────────────────────────────
+loss:
+  lambda_sds:              1.0
+  lambda_penetration:      0.1
+  lambda_stretch:          0.05
+  lambda_temporal_smooth:  0.02
+
+# ── SPSA-A optimizer (Spall 1998) ─────────────────────────────────────────────
+# Gain sequences:
+#   a_k = a / (k + 1 + A)^alpha      (step size)
+#   c_k = c / (k + 1)^gamma          (perturbation)
+# Recommended values from Spall (1998) for noisy loss estimates.
+spsa:
+  a:      0.01                  # initial step-size coefficient
+  c:      0.05                  # initial perturbation coefficient
+  A:      null                  # stability constant (null → 0.1 × total_iters)
+  alpha:  0.602
+  gamma:  0.101
+
+# ── Backprop optimizer (optional; only if grads flow through sim) ─────────────
+backprop:
+  optimizer:  adam              # adam | sgd
+  grad_clip:  1.0               # max-norm gradient clipping
+
+# ── Logging & checkpointing ───────────────────────────────────────────────────
+logging:
+  log_interval:   10            # log metrics every N iters
+  save_interval:  50            # save φ checkpoint every N iters
+  video_interval: 100           # save debug mp4 every N iters
+  keep_last_n:    5             # keep only the N most recent φ checkpoints

@@ -1,0 +1,99 @@
+# =============================================================================
+# bridge_sds/configs/sds_test.yaml
+# Hypothesis-test config: SDS via Wan 5B instead of MSE geometric loss.
+#
+# Key differences from sds_phi.yaml:
+#   - Lower D (lighter cloth), lower E (less stiff) — explore different region
+#   - Friction added as a differentiable SPSA parameter
+#   - Shorter clips + fewer substeps for ~100 iterations in feasible time
+#   - Log every iteration (research mode)
+# =============================================================================
+
+# ── Physics parameter search space ───────────────────────────────────────────
+phi:
+  D:                            # Cloth density (kg/m^3)
+    init:  0.3                  # lighter than default 1.0
+    min:   0.1
+    max:   3.0
+  E:                            # Young's modulus (stored ×100 in MPMAvatar)
+    init:  50.0                 # less stiff than default 100 Pa
+    min:   0.5
+    max:   20.0
+  H:                            # Height / initial-cloth-scale factor
+    init:  0.95                 # slightly different from default 1.0
+    min:   0.8
+    max:   1.2
+  friction:                     # Body-cloth friction coefficient (NEW param)
+    init:  0.3                  # lower than default 0.5 — hypothesis: friction matters
+    min:   0.01
+    max:   1.0
+
+# ── Fixed MPM material parameters ────────────────────────────────────────────
+mpm_fixed:
+  nu:     0.3
+  gamma:  300.0                 # softer shear than default 500
+  kappa:  300.0                 # softer bulk than default 500
+  friction_angle: 35.0          # slightly lower than default 40
+
+# ── MPM simulation settings ──────────────────────────────────────────────────
+mpm:
+  substep:   200                # fewer substeps per frame (default 400) for speed
+  grid_size: 100                # smaller grid (default 200) for speed
+  fps:       25.0
+
+# ── Clip sampling per hypothesis-test iteration ──────────────────────────────
+clip:
+  frame_num:    10              # short clips — enough to observe cloth motion
+  jitter_range: 2               # small jitter
+
+# ── Gaussian rendering ────────────────────────────────────────────────────────
+render:
+  width:  512
+  height: 512
+  bg_white: true
+
+# ── SDS (Wan 5B) settings ─────────────────────────────────────────────────────
+sds:
+  target_resolution: 128        # resize before Wan VAE encode
+  timestep_min:  50
+  timestep_max:  950
+  use_amp: true                 # fp16 autocast for Wan inference
+  prompt: "the person in the image is moving"
+
+# ── Loss weights ──────────────────────────────────────────────────────────────
+loss:
+  lambda_sds:              1.0
+  lambda_friction_reg:     0.01  # penalise large friction gradient jumps
+
+# ── SPSA perturbation magnitudes ──────────────────────────────────────────────
+spsa:
+  dD:        0.05
+  dE:        0.05
+  dH:        0.005
+  dfriction: 0.02
+  cosine_decay:      true       # anneal perturbation sizes over training
+  cosine_min_factor: 0.1        # minimum scale at end of training (10% of original)
+
+# ── Per-parameter learning rates ──────────────────────────────────────────────
+lr:
+  D:        0.01
+  E:        0.30
+  H:        0.01
+  friction: 0.01               # simple gradient descent (not Adam)
+
+# ── Random initialisation (hypothesis: does SDS recover plausible params?) ────
+random_init: true              # randomise H and friction (D+E via --random_init_params)
+
+# ── Training ──────────────────────────────────────────────────────────────────
+training:
+  n_iterations:    1000
+  log_every:       1           # log every single step (research mode)
+  save_every:      100
+  video_every:     50          # render+log gif every N steps
+  max_extra_cameras: 16        # train cameras added to pool (uniformly sampled)
+
+# ── Logging ───────────────────────────────────────────────────────────────────
+logging:
+  log_all_perturbation_losses: true   # log SDS loss for every SPSA perturbation
+  log_gradients:               true
+  log_param_trajectory:        true   # save params.csv for offline analysis
