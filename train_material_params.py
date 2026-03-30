@@ -177,9 +177,9 @@ class Trainer:
         }
 
         self.torch_param = {
-            'D': torch.tensor(float(param['D']), requires_grad=False),
-            'E': torch.tensor(float(param['E']), requires_grad=False),
-            'H': torch.tensor(float(param['H']), requires_grad=False),
+            'D': torch.tensor(float(param['D']), requires_grad=True),
+            'E': torch.tensor(float(param['E']), requires_grad=True),
+            'H': torch.tensor(float(param['H']), requires_grad=True),
         }
 
         self.mesh_friction_coeff = args.mesh_friction_coeff

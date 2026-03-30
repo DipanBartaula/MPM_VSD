@@ -281,14 +281,14 @@ class MPMStateStruct:
 
         if tensor_x is not None:
             self.particle_x = from_torch_safe(
-                tensor_x.contiguous().detach(),
+                tensor_x.contiguous(),
                 dtype=wp.vec3,
                 requires_grad=requires_grad,
             )
         
         if tensor_d is not None:
             self.particle_d = from_torch_safe(
-                tensor_d.contiguous().detach().clone(),
+                tensor_d.contiguous(),
                 dtype=wp.mat33,
                 requires_grad=requires_grad,
             )
@@ -300,7 +300,7 @@ class MPMStateStruct:
         
         if tensor_R_inv is not None:
             self.particle_R_inv = from_torch_safe(
-                tensor_R_inv.contiguous().detach().clone(),
+                tensor_R_inv.contiguous(),
                 dtype=wp.vec3,
                 requires_grad=requires_grad,
             )
@@ -313,7 +313,7 @@ class MPMStateStruct:
 
         if tensor_velocity is not None:
             self.particle_v = from_torch_safe(
-                tensor_velocity.contiguous().detach().clone(),
+                tensor_velocity.contiguous(),
                 dtype=wp.vec3,
                 requires_grad=requires_grad,
             )
@@ -441,9 +441,9 @@ class MPMStateStruct:
     ):
         n_particles = tensor_density.shape[0]
         wp_density = from_torch_safe(
-            tensor_density.contiguous().detach().clone(),
+            tensor_density.contiguous(),
             dtype=wp.float32,
-            requires_grad=False,
+            requires_grad=requires_grad,
         )
         
         wp.launch(
@@ -771,7 +771,7 @@ class Dirichlet_collider:
 @wp.struct
 class Mesh_collider:
     mesh_id: wp.uint64
-    friction: float
+    friction: wp.array(dtype=float, ndim=1)
     weight: wp.array(dtype=float, ndim=3)
     mesh_v_in: wp.array(dtype=wp.vec3, ndim=3)
     mesh_v_out: wp.array(dtype=wp.vec3, ndim=3)

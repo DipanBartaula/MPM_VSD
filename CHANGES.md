@@ -14,6 +14,7 @@ Target: 100 SPSA iterations on ActorsHQ Actor 1 / Sequence 1, frames 460–469.
 | File | Purpose |
 |------|---------|
 | `train_sds_physics.py` | Main entry point. Subclasses `Trainer` from `train_material_params.py`, overrides `train_one_step()` to use Wan SDS loss instead of MSE. Adds friction as SPSA parameter. Logs full CSV trajectory. |
+| `training_runs/training.sh` | Shared bash launcher for the VDS workflow: MPM rollout -> frame rendering -> video assembly -> SDS updates of simulation parameters. |
 | `bridge_sds/wan22_i2v_guidance.py` | Wan 2.2 I2V wrapper. Loads VAE + low-noise expert, encodes video to latent, computes flow-prediction SDS loss at a random timestep. |
 | `bridge_sds/physical_regularizers.py` | Penalty losses: `L_pen` (penetration), `L_stretch` (stretch), `L_temporal_smooth` (temporal smoothness). |
 | `bridge_sds/runner_mpmavatar.py` | Simulation + rendering runner used by the bridge. |

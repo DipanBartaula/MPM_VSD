@@ -198,22 +198,22 @@ class MPMWARP(object):
         if E.ndim == 0:
             E_inp = E.item()  # float
         else:
-            E_inp = from_torch_safe(E, dtype=wp.float32, requires_grad=True)
+            E_inp = from_torch_safe(E, dtype=wp.float32, requires_grad=bool(E.requires_grad))
 
         if nu.ndim == 0:
             nu_inp = nu.item()  # float
         else:
-            nu_inp = from_torch_safe(nu, dtype=wp.float32, requires_grad=True)
+            nu_inp = from_torch_safe(nu, dtype=wp.float32, requires_grad=bool(nu.requires_grad))
 
         if gamma.ndim == 0:
             gamma_inp = gamma.item()  # float
         else:
-            gamma_inp = from_torch_safe(gamma, dtype=wp.float32, requires_grad=True)
+            gamma_inp = from_torch_safe(gamma, dtype=wp.float32, requires_grad=bool(gamma.requires_grad))
 
         if kappa.ndim == 0:
             kappa_inp = kappa.item()  # float
         else:
-            kappa_inp = from_torch_safe(kappa, dtype=wp.float32, requires_grad=True)
+            kappa_inp = from_torch_safe(kappa, dtype=wp.float32, requires_grad=bool(kappa.requires_grad))
 
         self.set_E_nu(mpm_model, E_inp, nu_inp, gamma_inp, kappa_inp, device=device)
 
@@ -242,7 +242,7 @@ class MPMWARP(object):
             mpm_model.grid_dim_z,
         )
         wp.launch(
-            kernel=zero_grid,  # gradient might gone
+            kernel=zero_grid,
             dim=(grid_size),
             inputs=[mpm_state, mpm_model],
             device=device,
@@ -279,11 +279,25 @@ class MPMWARP(object):
             )
         
         if joint_traditional_v is not None:
-            new_joint_traditional_v = wp.from_numpy(joint_traditional_v.detach().cpu().numpy(), dtype=wp.vec3, device=device)
+            if hasattr(joint_traditional_v, "device"):
+                new_joint_traditional_v = from_torch_safe(
+                    joint_traditional_v.contiguous(),
+                    dtype=wp.vec3,
+                    requires_grad=False,
+                )
+            else:
+                new_joint_traditional_v = wp.from_numpy(joint_traditional_v.detach().cpu().numpy(), dtype=wp.vec3, device=device)
             joint_num = joint_traditional_v.shape[0]
 
         if mesh_x is not None:
-            new_mesh_points = wp.from_numpy(mesh_x.detach().cpu().numpy(), dtype=wp.vec3, device=device)
+            if hasattr(mesh_x, "device"):
+                new_mesh_points = from_torch_safe(
+                    mesh_x.contiguous(),
+                    dtype=wp.vec3,
+                    requires_grad=False,
+                )
+            else:
+                new_mesh_points = wp.from_numpy(mesh_x.detach().cpu().numpy(), dtype=wp.vec3, device=device)
 
             with wp.ScopedTimer(
                 "update_mesh_positions",
@@ -299,7 +313,14 @@ class MPMWARP(object):
                 )
 
         if mesh_v is not None:
-            new_mesh_velocities = wp.from_numpy(mesh_v.detach().cpu().numpy(), dtype=wp.vec3, device=device)
+            if hasattr(mesh_v, "device"):
+                new_mesh_velocities = from_torch_safe(
+                    mesh_v.contiguous(),
+                    dtype=wp.vec3,
+                    requires_grad=False,
+                )
+            else:
+                new_mesh_velocities = wp.from_numpy(mesh_v.detach().cpu().numpy(), dtype=wp.vec3, device=device)
 
             with wp.ScopedTimer(
                 "update_mesh_velocities",
@@ -419,8 +440,22 @@ class MPMWARP(object):
                 )
         
         if joint_verts_v is not None and joint_faces_v is not None:
-            new_joint_verts_v = wp.from_numpy(joint_verts_v.detach().cpu().numpy(), dtype=wp.vec3, device=device)
-            new_joint_faces_v = wp.from_numpy(joint_faces_v.detach().cpu().numpy(), dtype=wp.vec3, device=device)
+            if hasattr(joint_verts_v, "device"):
+                new_joint_verts_v = from_torch_safe(
+                    joint_verts_v.contiguous(),
+                    dtype=wp.vec3,
+                    requires_grad=False,
+                )
+            else:
+                new_joint_verts_v = wp.from_numpy(joint_verts_v.detach().cpu().numpy(), dtype=wp.vec3, device=device)
+            if hasattr(joint_faces_v, "device"):
+                new_joint_faces_v = from_torch_safe(
+                    joint_faces_v.contiguous(),
+                    dtype=wp.vec3,
+                    requires_grad=False,
+                )
+            else:
+                new_joint_faces_v = wp.from_numpy(joint_faces_v.detach().cpu().numpy(), dtype=wp.vec3, device=device)
             # apply Particle Moving on grid
             with wp.ScopedTimer(
                 "apply_Particle_Moving_on_grid", synchronize=True, print=False, dict=self.time_profile
@@ -500,38 +535,37 @@ class MPMWARP(object):
                 if self.modify_bc[k] is not None:
                     self.modify_bc[k](self.time, dt, self.collider_params[k])
 
-        # # g2p
-        # with wp.ScopedTimer(
-        #     "g2p", synchronize=True, print=False, dict=self.time_profile
-        # ):
-        #     wp.launch(
-        #         kernel=g2p_differentiable,
-        #         dim=self.n_particles,
-        #         inputs=[mpm_state, next_state, mpm_model, dt],
-        #         device=device,
-        #     )  # x, v, C, F_trial are updated
+        # Use the out-of-place differentiable G2P path. Forward dynamics match the
+        # original kernels, but avoiding in-place state mutation gives Warp a
+        # cleaner backward graph.
+        next_state = mpm_state.to_small_state(device=device, requires_grad=True)
 
-        # g2p_v
         with wp.ScopedTimer(
             "g2p_v", synchronize=True, print=False, dict=self.time_profile
         ):
             wp.launch(
-                kernel=g2p_v,
+                kernel=g2p_v_differentiable,
                 dim=(self.n_particles-self.n_elements),
-                inputs=[mpm_state, mpm_model, dt, self.n_elements],
+                inputs=[mpm_state, next_state, mpm_model, dt, self.n_elements],
                 device=device,
-            )  # x, v, C, F_trial are updated
+            )
 
-        # g2p_e
         with wp.ScopedTimer(
             "g2p_e", synchronize=True, print=False, dict=self.time_profile
         ):
             wp.launch(
-                kernel=g2p_e,
+                kernel=g2p_e_differentiable,
                 dim=self.n_elements,
-                inputs=[mpm_state, mpm_model, dt, self.n_no_vertices],
+                inputs=[mpm_state, next_state, mpm_model, dt, self.n_no_vertices],
                 device=device,
-            )  # x, v, C, F_trial are updated
+            )
+
+        wp.launch(
+            kernel=copy_state,
+            dim=self.n_particles,
+            inputs=[mpm_state, next_state, mpm_state.particle_R_inv, self.n_elements],
+            device=device,
+        )
 
         self.time = self.time + dt
 
@@ -810,7 +844,12 @@ class MPMWARP(object):
     ):
         collider_param = Mesh_collider()
         collider_param.mesh_id = mesh_id
-        collider_param.friction = friction
+        collider_param.friction = wp.from_numpy(
+            np.asarray([friction], dtype=np.float32),
+            dtype=wp.float32,
+            device="cuda:0",
+            requires_grad=False,
+        )
         collider_param.weight = wp.zeros(shape=(n_grid, n_grid, n_grid), dtype=float, device="cuda:0")
         collider_param.mesh_v_in = wp.zeros(shape=(n_grid, n_grid, n_grid), dtype=wp.vec3, device="cuda:0")
         collider_param.mesh_v_out = wp.zeros(shape=(n_grid, n_grid, n_grid), dtype=wp.vec3, device="cuda:0")
@@ -900,18 +939,16 @@ class MPMWARP(object):
                 v_rel = v - param.mesh_v_out[grid_x, grid_y, grid_z]
                 n = wp.normalize(param.mesh_normal[grid_x, grid_y, grid_z])
                 normal_component = wp.dot(v_rel, n)
-                v_proj = (
-                    v_rel - wp.min(normal_component, 0.0) * n
-                )  # Project out only inward normal component
-                if normal_component < 0.0 and wp.length(v_proj) > 1e-20:
-                    v_fric = wp.max(
-                        0.0, wp.length(v_proj) + normal_component * param.friction
-                    ) * wp.normalize(
-                        v_proj
-                    )  # apply friction here
-                    # ) + 1e-1 * n # apply friction here
-                else:
-                    v_fric = v_proj
+                inward_speed = smooth_positive_part(-normal_component, SMOOTH_BRANCH_TEMP)
+                v_proj = v_rel + inward_speed * n
+                tangent_norm = wp.sqrt(wp.dot(v_proj, v_proj) + SMOOTH_BRANCH_EPS)
+                tangent_dir = v_proj * (1.0 / tangent_norm)
+                friction = param.friction[0]
+                tangent_after_friction = smooth_positive_part(
+                    tangent_norm - friction * inward_speed,
+                    SMOOTH_BRANCH_TEMP,
+                )
+                v_fric = tangent_after_friction * tangent_dir
                 state.grid_v_out[grid_x, grid_y, grid_z] = v_fric + param.mesh_v_out[grid_x, grid_y, grid_z]
             else:
                 state.grid_v_out[grid_x, grid_y, grid_z] = v

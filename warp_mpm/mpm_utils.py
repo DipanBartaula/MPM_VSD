@@ -4,6 +4,41 @@ import numpy as np
 import math
 
 
+SMOOTH_BRANCH_EPS = 1.0e-6
+SMOOTH_BRANCH_TEMP = 1.0e-3
+
+
+@wp.func
+def smooth_abs_scalar(x: float, eps: float):
+    return wp.sqrt(x * x + eps * eps)
+
+
+@wp.func
+def smooth_sign_scalar(x: float, eps: float):
+    return x / smooth_abs_scalar(x, eps)
+
+
+@wp.func
+def smooth_positive_part(x: float, eps: float):
+    return 0.5 * (x + smooth_abs_scalar(x, eps))
+
+
+@wp.func
+def smooth_upper_clamp_one(x: float, eps: float):
+    # Smooth approximation of min(x, 1.0)
+    return 1.0 - smooth_positive_part(1.0 - x, eps)
+
+
+@wp.func
+def diag_sign_flip_0_2(s: float):
+    return wp.mat33(s, 0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0, s)
+
+
+@wp.func
+def diag_sign_flip_1_2(s: float):
+    return wp.mat33(1.0, 0.0, 0.0, 0.0, s, 0.0, 0.0, 0.0, s)
+
+
 # compute stress from F
 @wp.func
 def kirchoff_stress_FCR(
@@ -109,18 +144,15 @@ def kirchoff_stress_Anisotropy(
     Q_0 = wp.mat33(0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0)
     R_0 = wp.mat33(0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0)
     wp.qr3(d, Q_0, R_0)
-    if R_0[0,0] < 0:
-        Q_1 = wp.mat33(-Q_0[0,0], Q_0[0,1], -Q_0[0,2], -Q_0[1,0], Q_0[1,1], -Q_0[1,2], -Q_0[2,0], Q_0[2,1], -Q_0[2,2])
-        R_1 = wp.mat33(-R_0[0,0], -R_0[0,1], -R_0[0,2], 0.0, R_0[1,1], R_0[1,2], 0.0, 0.0, -R_0[2,2])
-    else:
-        Q_1 = Q_0
-        R_1 = R_0
-    if R_1[1,1] < 0:
-        Q = wp.mat33(Q_1[0,0], -Q_1[0,1], -Q_1[0,2], Q_1[1,0], -Q_1[1,1], -Q_1[1,2], Q_1[2,0], -Q_1[2,1], -Q_1[2,2])
-        R = wp.mat33(R_1[0,0], R_1[0,1], R_1[0,2], 0.0, -R_1[1,1], -R_1[1,2], 0.0, 0.0, -R_1[2,2])
-    else:
-        Q = Q_1
-        R = R_1
+    s0 = smooth_sign_scalar(R_0[0, 0], SMOOTH_BRANCH_EPS)
+    D0 = diag_sign_flip_0_2(s0)
+    Q_1 = Q_0 * D0
+    R_1 = D0 * R_0
+
+    s1 = smooth_sign_scalar(R_1[1, 1], SMOOTH_BRANCH_EPS)
+    D1 = diag_sign_flip_1_2(s1)
+    Q = Q_1 * D1
+    R = D1 * R_1
 
     F11 = R[0,0] * iD11
     F12 = R[0,0] * iD12 + R[0,1] * iD22
@@ -148,10 +180,8 @@ def kirchoff_stress_Anisotropy(
     dr22 = K2[1,1]
     dr13 = gamma * R[0,2]
     dr23 = gamma * R[1,2]
-    if R[2,2] > 1.0:
-        dr33 = 0.0
-    else:
-        dr33 = -kappa * (1.0 - R[2,2]) * (1.0 - R[2,2])
+    compression = smooth_positive_part(1.0 - R[2, 2], SMOOTH_BRANCH_TEMP)
+    dr33 = -kappa * compression * compression
 
     dr = wp.mat33(dr11, dr12, dr13, 0.0, dr22, dr23, 0.0, 0.0, dr33)
     K3 = dr * RiDT
@@ -181,27 +211,27 @@ def anisotropy_return_mapping(d: wp.mat33, model: MPMModelStruct, p: int):
     Q_0 = wp.mat33(0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0)
     R_0 = wp.mat33(0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0)
     wp.qr3(d, Q_0, R_0)
-    if R_0[0,0] < 0:
-        Q_1 = wp.mat33(-Q_0[0,0], Q_0[0,1], -Q_0[0,2], -Q_0[1,0], Q_0[1,1], -Q_0[1,2], -Q_0[2,0], Q_0[2,1], -Q_0[2,2])
-        R_1 = wp.mat33(-R_0[0,0], -R_0[0,1], -R_0[0,2], 0.0, R_0[1,1], R_0[1,2], 0.0, 0.0, -R_0[2,2])
-    else:
-        Q_1 = Q_0
-        R_1 = R_0
-    if R_1[1,1] < 0:
-        Q = wp.mat33(Q_1[0,0], -Q_1[0,1], -Q_1[0,2], Q_1[1,0], -Q_1[1,1], -Q_1[1,2], Q_1[2,0], -Q_1[2,1], -Q_1[2,2])
-        R_2 = wp.mat33(R_1[0,0], R_1[0,1], R_1[0,2], 0.0, -R_1[1,1], -R_1[1,2], 0.0, 0.0, -R_1[2,2])
-    else:
-        Q = Q_1
-        R_2 = R_1
-    if R_2[2,2] > 1.0:
-        R = wp.mat33(R_2[0,0], R_2[0,1], R_2[0,2], R_2[1,0], R_2[1,1], R_2[1,2], 0.0, 0.0, 1.0)
-    else:
-        fn = model.kappa[p] * (1.0 - R_2[2,2]) * (1.0 - R_2[2,2])
-        ff = model.gamma[p] * wp.sqrt(R_2[0,2] * R_2[0,2] + R_2[1,2] * R_2[1,2])
-        if ff > model.friction_coeff * fn:
-            R = wp.mat33(R_2[0,0], R_2[0,1], R_2[0,2] * model.friction_coeff * fn / ff, R_2[1,0], R_2[1,1], R_2[1,2] * model.friction_coeff * fn / ff, R_2[2,0], R_2[2,1], R_2[2,2])
-        else:
-            R = R_2
+    s0 = smooth_sign_scalar(R_0[0, 0], SMOOTH_BRANCH_EPS)
+    D0 = diag_sign_flip_0_2(s0)
+    Q_1 = Q_0 * D0
+    R_1 = D0 * R_0
+
+    s1 = smooth_sign_scalar(R_1[1, 1], SMOOTH_BRANCH_EPS)
+    D1 = diag_sign_flip_1_2(s1)
+    Q = Q_1 * D1
+    R_2 = D1 * R_1
+
+    compression = smooth_positive_part(1.0 - R_2[2, 2], SMOOTH_BRANCH_TEMP)
+    r22_projected = 1.0 - compression
+    fn = model.kappa[p] * compression * compression
+    ff = model.gamma[p] * wp.sqrt(R_2[0, 2] * R_2[0, 2] + R_2[1, 2] * R_2[1, 2] + SMOOTH_BRANCH_EPS)
+    slip_ratio = model.friction_coeff * fn / ff
+    slip_scale = smooth_upper_clamp_one(slip_ratio, SMOOTH_BRANCH_TEMP)
+    R = wp.mat33(
+        R_2[0, 0], R_2[0, 1], R_2[0, 2] * slip_scale,
+        R_2[1, 0], R_2[1, 1], R_2[1, 2] * slip_scale,
+        R_2[2, 0], R_2[2, 1], r22_projected,
+    )
     
     d3 = Q * wp.vec3(R[0,2], R[1,2], R[2,2])
     new_d = wp.mat33(d[0,0], d[0,1], d3[0], d[1,0], d[1,1], d3[1], d[2,0], d[2,1], d3[2])
@@ -415,6 +445,20 @@ def zero_grid(state: MPMStateStruct, model: MPMModelStruct):
     state.grid_v_in[grid_x, grid_y, grid_z] = wp.vec3(0.0, 0.0, 0.0)
     state.grid_v_out[grid_x, grid_y, grid_z] = wp.vec3(0.0, 0.0, 0.0)
     # state.grid_v_final[grid_x, grid_y, grid_z] = wp.vec3(0.0, 0.0, 0.0)
+
+
+@wp.func
+def clamp_particle_position_to_grid_bounds(x: wp.vec3, model: MPMModelStruct):
+    # This keeps the same forward boundary behavior as before. The clamp is only
+    # piecewise differentiable, but it is still a valid taped operation.
+    dx = 1.0 / model.inv_dx
+    a_min = dx * 2.0
+    a_max = model.grid_lim - dx * 2.0
+    return wp.vec3(
+        wp.clamp(x[0], a_min, a_max),
+        wp.clamp(x[1], a_min, a_max),
+        wp.clamp(x[2], a_min, a_max),
+    )
 
 
 @wp.func
@@ -903,20 +947,10 @@ def g2p_v_differentiable(
 
         next_state.particle_v[p+offset] = new_v
 
-        # add clip here:
         new_x = state.particle_x[p+offset] + dt * new_v
-        dx = 1.0 / model.inv_dx
-        a_min = dx * 2.0
-        a_max = model.grid_lim - dx * 2.0
-
-        new_x_clamped = wp.vec3(
-            wp.clamp(new_x[0], a_min, a_max),
-            wp.clamp(new_x[1], a_min, a_max),
-            wp.clamp(new_x[2], a_min, a_max),
+        next_state.particle_x[p+offset] = clamp_particle_position_to_grid_bounds(
+            new_x, model
         )
-        next_state.particle_x[p+offset] = new_x_clamped
-
-        # next_state.particle_x[p] = new_x
 
         next_state.particle_C[p+offset] = new_C
 
@@ -995,22 +1029,13 @@ def g2p_e_differentiable(
 
 @wp.kernel
 def clip_particle_x(state: MPMStateStruct, model: MPMModelStruct):
+    # Legacy in-place clamp kernel. Keep it for non-taped utility use only; the
+    # active autodiff path clamps positions inside g2p_v_differentiable instead.
     p = wp.tid()
 
     posx = state.particle_x[p]
     if state.particle_selection[p] == 0:
-        dx = 1.0 / model.inv_dx
-        a_min = dx * 2.0
-        a_max = model.grid_lim - dx * 2.0
-        new_x = wp.vec3(
-            wp.clamp(posx[0], a_min, a_max),
-            wp.clamp(posx[1], a_min, a_max),
-            wp.clamp(posx[2], a_min, a_max),
-        )
-
-        state.particle_x[
-            p
-        ] = new_x  # Warn: this gives wrong gradient, don't use this for backward
+        state.particle_x[p] = clamp_particle_position_to_grid_bounds(posx, model)
 
 
 # compute (Kirchhoff) stress = stress(returnMap(F_trial))
@@ -1262,6 +1287,22 @@ def compute_position_l2_loss(
     # l1_diff = wp.abs(pos - pos_gt)
     l2 = wp.length(pos - pos_gt)
 
+    wp.atomic_add(loss, 0, l2)
+
+
+@wp.kernel
+def compute_vertex_position_l2_loss(
+    mpm_state: MPMStateStruct,
+    gt_pos: wp.array(dtype=wp.vec3),
+    vertex_start: int,
+    loss: wp.array(dtype=float),
+):
+    tid = wp.tid()
+
+    pos = mpm_state.particle_x[vertex_start + tid]
+    pos_gt = gt_pos[tid]
+    diff = pos - pos_gt
+    l2 = wp.dot(diff, diff)
     wp.atomic_add(loss, 0, l2)
 
 

@@ -23,6 +23,7 @@ SPSA probes the scalar loss with ±Δφ and estimates ∂L/∂φ numerically.
 
 from __future__ import annotations
 
+import math
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Optional
@@ -220,6 +221,75 @@ class Wan22I2VGuidance(nn.Module):
             outputs = self.image_encoder(**inputs, output_hidden_states=True)
         return outputs.hidden_states[-2].to(self._dtype)  # (B, seq_len, dim)
 
+    def build_condition_attention_mask(
+        self,
+        cond_image_01: torch.Tensor,
+        *,
+        num_frames: int,
+        height: int,
+        width: int,
+    ) -> torch.Tensor:
+        """
+        Build a soft spatial mask from averaged conditioning-image attention maps.
+
+        The mask is computed fully under `torch.no_grad()` so it does not become
+        part of the optimization graph. The resulting mask is broadcast over the
+        video time dimension and can be passed to `mask_01` in `compute_loss()`.
+        """
+        if cond_image_01.ndim == 3:
+            cond_image_01 = cond_image_01.unsqueeze(0)
+
+        import numpy as np
+
+        imgs_np = cond_image_01.detach().cpu().permute(0, 2, 3, 1).numpy() * 255.0
+        imgs_np = imgs_np.astype(np.uint8)
+        imgs_list = [img for img in imgs_np]
+
+        inputs = self.image_processor(images=imgs_list, return_tensors="pt").to(self.device)
+
+        with torch.no_grad():
+            outputs = self.image_encoder(**inputs, output_attentions=True)
+
+        attentions = getattr(outputs, "attentions", None)
+        if not attentions:
+            raise RuntimeError(
+                "Wan image encoder did not return attention maps; cannot build "
+                "conditioning attention mask."
+            )
+
+        layer_maps = []
+        for attn in attentions:
+            # attn: [B, heads, tokens, tokens]
+            attn = attn.float().abs().mean(dim=1)
+            if attn.shape[-1] <= 1:
+                continue
+            cls_to_patch = attn[:, 0, 1:]
+            patch_to_cls = attn[:, 1:, 0]
+            patch_energy = 0.5 * (cls_to_patch + patch_to_cls)
+            layer_maps.append(patch_energy)
+
+        if not layer_maps:
+            raise RuntimeError("No usable attention maps were returned by the image encoder.")
+
+        patch_map = torch.stack(layer_maps, dim=0).mean(dim=0)
+        num_patches = patch_map.shape[-1]
+        side = int(math.isqrt(num_patches))
+        if side * side != num_patches:
+            raise RuntimeError(
+                f"Conditioning attention patch count {num_patches} is not square."
+            )
+
+        spatial = patch_map.reshape(patch_map.shape[0], 1, side, side)
+        spatial = spatial - spatial.amin(dim=(-2, -1), keepdim=True)
+        spatial = spatial / spatial.amax(dim=(-2, -1), keepdim=True).clamp_min(1e-6)
+        spatial = F.interpolate(
+            spatial,
+            size=(height, width),
+            mode="bilinear",
+            align_corners=False,
+        )
+        return spatial.unsqueeze(2).expand(-1, -1, num_frames, -1, -1).contiguous()
+
     # ── VAE helpers ───────────────────────────────────────────────────────────
 
     def _vae_encode(
@@ -269,27 +339,25 @@ class Wan22I2VGuidance(nn.Module):
         """
         # return_dict=False → returns tuple; [0] is the output tensor.
         # This avoids any potential Transformer2DModelOutput attribute issues.
-        with torch.no_grad():
-            out = self.transformer(
-                hidden_states=x_t,
-                timestep=timesteps,
-                encoder_hidden_states=context,
-                encoder_hidden_states_image=image_embeds,
-                return_dict=False,
-            )
+        out = self.transformer(
+            hidden_states=x_t,
+            timestep=timesteps,
+            encoder_hidden_states=context,
+            encoder_hidden_states_image=image_embeds,
+            return_dict=False,
+        )
         pred = out[0]  # (B, 16, T', H', W') bfloat16
 
         # Optional classifier-free guidance
         if self.cfg.use_cfg:
             context_null = self._context_null.expand(x_t.shape[0], -1, -1)
-            with torch.no_grad():
-                out_uncond = self.transformer(
-                    hidden_states=x_t,
-                    timestep=timesteps,
-                    encoder_hidden_states=context_null,
-                    encoder_hidden_states_image=image_embeds,
-                    return_dict=False,
-                )
+            out_uncond = self.transformer(
+                hidden_states=x_t,
+                timestep=timesteps,
+                encoder_hidden_states=context_null,
+                encoder_hidden_states_image=image_embeds,
+                return_dict=False,
+            )
             pred_uncond = out_uncond[0]
             pred = pred_uncond + float(self.cfg.cfg_scale) * (pred - pred_uncond)
 

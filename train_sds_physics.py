@@ -54,6 +54,7 @@ import os
 import random
 import sys
 import time
+import math
 import yaml
 from pathlib import Path
 from typing import Dict, List, Optional, Tuple
@@ -67,6 +68,8 @@ import warp as wp
 from arguments import ModelParams, PipelineParams, OptimizationParams
 from gaussian_renderer import render
 from train_material_params import Trainer, convert_SH
+from bridge_sds.physical_regularizers import compute_all_regularizers
+from warp_mpm.warp_utils import from_torch_safe
 
 try:
     from bridge_sds.wan22_i2v_guidance import Wan22I2VConfig, Wan22I2VGuidance
@@ -90,6 +93,47 @@ def _clamp(val: float, lo: float, hi: float) -> float:
 def _load_sds_cfg(path: str) -> dict:
     with open(path) as f:
         return yaml.safe_load(f)
+
+
+def _uniform_clip_starts(total_frames: int, clip_len: int, num_clips: int) -> List[int]:
+    """Choose `num_clips` start indices spread over a rollout."""
+    if total_frames <= 0:
+        return [0] * num_clips
+
+    max_start = max(total_frames - clip_len, 0)
+    if num_clips <= 1:
+        return [max_start // 2]
+    if max_start == 0:
+        return [0] * num_clips
+
+    return [int(round(i * max_start / (num_clips - 1))) for i in range(num_clips)]
+
+
+def _slice_or_pad_frames(frames: List[torch.Tensor], start: int, count: int) -> List[torch.Tensor]:
+    if not frames:
+        raise ValueError("Cannot slice from an empty frame list.")
+    start = max(0, start)
+    sliced = frames[start:start + count]
+    if not sliced:
+        sliced = [frames[-1]]
+    while len(sliced) < count:
+        sliced.append(sliced[-1])
+    return sliced
+
+
+def _sample_taped_substeps(num_substeps: int, taped_substeps: int) -> List[int]:
+    if num_substeps <= 0:
+        return []
+    taped_substeps = max(1, min(taped_substeps, num_substeps))
+    if taped_substeps == 1:
+        return [num_substeps - 1]
+    if taped_substeps == num_substeps:
+        return list(range(num_substeps))
+
+    interior_count = taped_substeps - 1
+    interior = random.sample(range(num_substeps - 1), interior_count)
+    sampled = sorted(interior + [num_substeps - 1])
+    return sampled
 
 
 # ---------------------------------------------------------------------------
@@ -131,19 +175,28 @@ class SDSPhysicsTrainer(Trainer):
 
         self.sds_cfg = sds_cfg
 
-        # ── Friction: SPSA parameter, managed separately from Adam ───────────
+        # ── Friction: fixed simulation parameter (not optimized) ─────────────
         friction_cfg = sds_cfg.get("phi", {}).get("friction", {})
         self.friction_val = float(friction_cfg.get("init", args.mesh_friction_coeff))
+        self.friction_init = self.friction_val
         self.friction_min = float(friction_cfg.get("min",  0.01))
         self.friction_max = float(friction_cfg.get("max",  1.0))
         self.param_ranges["friction"] = [self.friction_min, self.friction_max]
+        self.torch_param["friction"] = torch.tensor(
+            float(self.friction_val),
+            requires_grad=True,
+            device=self.torch_param["D"].device,
+        )
+        friction_lr = float(sds_cfg.get("lr", {}).get("friction", opt.lr_H))
+        self.optimizer.add_param_group(
+            {"params": [self.torch_param["friction"]], "lr": friction_lr}
+        )
         print(f"[SDS] Initial friction = {self.friction_val:.3f}  "
               f"range [{self.friction_min}, {self.friction_max}]")
 
-        # ── Random initialisation of H and friction ──────────────────────────
+        # ── Random initialisation of H only ──────────────────────────────────
         # D and E are randomised by the parent Trainer when --random_init_params
-        # is passed.  Here we randomise H and friction so the full φ vector
-        # starts from a uniformly random point in the search space.
+        # is passed. Here we randomise H only.
         if sds_cfg.get("random_init", False):
             H_cfg = sds_cfg.get("phi", {}).get("H", {})
             H_rnd = float(np.random.uniform(
@@ -151,13 +204,11 @@ class SDSPhysicsTrainer(Trainer):
                 float(H_cfg.get("max", 1.2)),
             ))
             self.torch_param["H"].data.fill_(H_rnd)
-            f_rnd = float(np.random.uniform(self.friction_min, self.friction_max))
-            self.friction_val = f_rnd
             print(
                 f"[SDS] Random init φ: "
                 f"D={self.torch_param['D'].item():.4f}  "
                 f"E={self.torch_param['E'].item()*100:.1f}Pa  "
-                f"H={H_rnd:.4f}  friction={f_rnd:.4f}"
+                f"H={H_rnd:.4f}  friction={self.friction_val:.4f}"
             )
 
         # ── Freeze shadow_net + set to eval mode ─────────────────────────────
@@ -207,6 +258,18 @@ class SDSPhysicsTrainer(Trainer):
             f"+ {len(extra_cameras)} train)"
         )
 
+        requested_cond_camera_idx = getattr(args, "condition_camera_idx", None)
+        if requested_cond_camera_idx is None:
+            requested_cond_camera_idx = self.scene.test_camera_index[0] if len(self.scene.test_camera_index) > 0 else 0
+        self.condition_camera_idx = int(requested_cond_camera_idx)
+        cond_matches = [(cam, cidx) for cam, cidx in self._cameras if int(cidx) == self.condition_camera_idx]
+        if not cond_matches:
+            raise ValueError(
+                f"Condition camera index {self.condition_camera_idx} is not available in the camera pool."
+            )
+        self._condition_camera = cond_matches[0]
+        print(f"[SDS] Condition camera idx: {self.condition_camera_idx}")
+
         # ── Load Wan 5B guidance (frozen) ────────────────────────────────────
         print(f"\n[SDS] Loading Wan 5B from {wan_ckpt_dir} …")
         ckpt_dir = Path(wan_ckpt_dir)
@@ -229,8 +292,8 @@ class SDSPhysicsTrainer(Trainer):
         print("[SDS] Wan 5B loaded and frozen.")
 
         # ── Precompute I2V conditioning image (first GT frame, camera 0) ─────
-        print("[SDS] Precomputing I2V conditioning image …")
-        cam0, cam0_idx = self._cameras[0]
+        print("[SDS] Precomputing fixed front-facing GSplat conditioning image …")
+        cam0, cam0_idx = self._condition_camera
         self.cond_image = self._render_frame(
             verts=self.train_frame_verts[0],
             camera=cam0,
@@ -276,12 +339,60 @@ class SDSPhysicsTrainer(Trainer):
                     "step", "D", "E_Pa", "H", "friction",
                     "sds_loss_base",
                     "sds_loss_dD", "sds_loss_dE", "sds_loss_dH", "sds_loss_dfriction",
-                    "grad_D", "grad_E", "grad_H", "grad_friction",
+                    "grad_D", "grad_E", "grad_H", "grad_friction", "grad_norm",
                     "camera_idx",
                 ])
         else:
             self._csv_file   = None
             self._csv_writer = None
+
+        # Curriculum over fixed 4.8s segments (120 frames at 25 FPS).
+        curriculum_cfg = sds_cfg.get("curriculum", {})
+        self.curriculum_clip_frames = int(curriculum_cfg.get("clip_frames", sds_cfg.get("clip", {}).get("frame_num", 120)))
+        self.curriculum_first_stage_iterations = int(curriculum_cfg.get("first_stage_iterations", 40))
+        self.curriculum_stage_iterations = int(curriculum_cfg.get("stage_iterations", 40))
+        self.curriculum_final_random_iterations = int(curriculum_cfg.get("final_random_iterations", 100))
+        self.curriculum_final_random_batch_clips = int(curriculum_cfg.get("final_random_batch_clips", 8))
+        self.curriculum_total_rollout_frames = max(int(self.scene.train_frame_num) - 1, 0)
+        self.curriculum_num_segments = max(
+            1,
+            math.ceil(self.curriculum_total_rollout_frames / max(self.curriculum_clip_frames, 1)),
+        )
+        self.curriculum_sequential_iterations = (
+            self.curriculum_first_stage_iterations
+            + max(0, self.curriculum_num_segments - 1) * self.curriculum_stage_iterations
+        )
+        self.curriculum_total_iterations = (
+            self.curriculum_sequential_iterations + self.curriculum_final_random_iterations
+        )
+        self.iterations = self.curriculum_total_iterations
+
+        zero_C = torch.zeros_like(self.particle_init_dir)
+        self.curriculum_stage_snapshots: List[Dict[str, torch.Tensor]] = [
+            {
+                "x": self.particle_init_position.detach().clone(),
+                "v": self.particle_init_velo.detach().clone(),
+                "d": self.particle_init_dir.detach().clone(),
+                "C": zero_C.detach().clone(),
+            }
+        ]
+        self.curriculum_stage_initial_positions: List[np.ndarray] = [
+            self.particle_init_position.detach().cpu().numpy()
+        ]
+        self.curriculum_positions_path = os.path.join(
+            self.output_path, "curriculum_stage_initial_positions.npy"
+        )
+        np.save(
+            self.curriculum_positions_path,
+            np.stack(self.curriculum_stage_initial_positions, axis=0),
+        )
+        print(
+            "[SDS] Curriculum: "
+            f"{self.curriculum_num_segments} fixed segments, "
+            f"sequential iters={self.curriculum_sequential_iterations}, "
+            f"final random iters={self.curriculum_final_random_iterations}, "
+            f"total={self.iterations}"
+        )
 
         print("\n[SDS] SDSPhysicsTrainer ready.\n")
 
@@ -289,21 +400,331 @@ class SDSPhysicsTrainer(Trainer):
     # Friction helpers
     # -----------------------------------------------------------------------
 
-    def _set_friction(self, val: float) -> None:
+    def _set_friction(self, val) -> None:
         """Update friction coefficient in every MPM mesh collider."""
         for collider in self.mpm_solver.mesh_collider_params:
-            collider.friction = float(val)
+            if isinstance(val, torch.Tensor):
+                friction_tensor = val.reshape(1).contiguous()
+                collider.friction = from_torch_safe(
+                    friction_tensor,
+                    dtype=wp.float32,
+                    requires_grad=bool(friction_tensor.requires_grad),
+                )
+            else:
+                collider.friction = wp.from_numpy(
+                    np.asarray([float(val)], dtype=np.float32),
+                    dtype=wp.float32,
+                    device="cuda:0",
+                    requires_grad=False,
+                )
+
+    def _segment_bounds(self, segment_idx: int) -> Tuple[int, int]:
+        frame_start = int(segment_idx) * self.curriculum_clip_frames
+        frame_end = min(frame_start + self.curriculum_clip_frames, self.curriculum_total_rollout_frames)
+        return frame_start, max(frame_end, frame_start)
+
+    def _curriculum_stage_for_step(self, step: int) -> Optional[int]:
+        if step < self.curriculum_first_stage_iterations:
+            return 0
+        remaining = step - self.curriculum_first_stage_iterations
+        stage_offset = remaining // max(self.curriculum_stage_iterations, 1)
+        stage_idx = 1 + stage_offset
+        if stage_idx >= self.curriculum_num_segments:
+            return None
+        return stage_idx
+
+    def _curriculum_phase(self, step: int) -> Tuple[str, List[int]]:
+        stage_idx = self._curriculum_stage_for_step(step)
+        if stage_idx is not None:
+            return "sequential", [stage_idx]
+
+        num_segments = max(self.curriculum_num_segments, 1)
+        batch_clips = min(self.curriculum_final_random_batch_clips, num_segments)
+        if batch_clips <= 0:
+            batch_clips = 1
+        if batch_clips >= num_segments:
+            return "random_fixed_batch", list(range(num_segments))
+        return "random_fixed_batch", random.sample(range(num_segments), batch_clips)
+
+    def _stage_iteration_range(self, stage_idx: int) -> Tuple[int, int]:
+        if stage_idx <= 0:
+            return 0, self.curriculum_first_stage_iterations
+        stage_start = self.curriculum_first_stage_iterations + (stage_idx - 1) * self.curriculum_stage_iterations
+        return stage_start, stage_start + self.curriculum_stage_iterations
+
+    def _capture_sim_snapshot(self) -> Dict[str, torch.Tensor]:
+        return {
+            "x": wp.to_torch(self.mpm_state.particle_x).detach().clone(),
+            "v": wp.to_torch(self.mpm_state.particle_v).detach().clone(),
+            "d": wp.to_torch(self.mpm_state.particle_d).detach().clone(),
+            "C": wp.to_torch(self.mpm_state.particle_C).detach().clone(),
+        }
+
+    def _persist_curriculum_stage_positions(self) -> None:
+        np.save(
+            self.curriculum_positions_path,
+            np.stack(self.curriculum_stage_initial_positions, axis=0),
+        )
+
+    def _render_segment_video_for_logging(
+        self,
+        phi: Dict[str, float],
+        segment_idx: int,
+        camera_info: Tuple,
+    ) -> torch.Tensor:
+        device = "cuda"
+        self._ensure_curriculum_snapshots(int(segment_idx))
+        start_snapshot = self.curriculum_stage_snapshots[int(segment_idx)]
+        frame_start, frame_end = self._segment_bounds(int(segment_idx))
+        segment_len = max(frame_end - frame_start, 0)
+        render_stride_steps = int(self.sds_cfg.get("clip", {}).get("frame_stride_steps", 1))
+        render_stride_steps = max(1, render_stride_steps)
+        cam, cidx = camera_info
+
+        particle_R_inv = self.compute_rest_dir_inv_from_vf(
+            torch.stack([
+                self.vertices_init_position[:, 0],
+                self.vertices_init_position[:, 1] * float(phi["H"]),
+                self.vertices_init_position[:, 2],
+            ], dim=1),
+            self.new_cloth_faces,
+        )
+
+        self.mpm_state.continue_from_torch(
+            start_snapshot["x"].clone(),
+            tensor_velocity=start_snapshot["v"].clone(),
+            tensor_d=start_snapshot["d"].clone(),
+            tensor_C=start_snapshot["C"].clone(),
+            tensor_R_inv=particle_R_inv.clone(),
+            device=device,
+            requires_grad=False,
+        )
+        self.mpm_state.set_require_grad(False)
+        self.mpm_model.set_require_grad(False)
+
+        density = torch.ones_like(self.particle_init_position[..., 0]) * float(phi["D"])
+        youngs = torch.ones_like(self.particle_init_position[..., 0]) * float(phi["E"]) * 100.0
+        self.mpm_state.reset_density(
+            density,
+            None,
+            device,
+            requires_grad=False,
+            update_mass=True,
+        )
+        self.mpm_solver.set_E_nu_from_torch(
+            self.mpm_model,
+            youngs,
+            self.poisson_ratio.detach().clone(),
+            self.gamma.detach().clone(),
+            self.kappa.detach().clone(),
+            device,
+        )
+        self.mpm_solver.prepare_mu_lam(self.mpm_model, self.mpm_state, device)
+        self._set_friction(phi["friction"])
+        self.mpm_solver.time = 0.0
+
+        delta_time = 1.0 / 25.0
+        substep_size = delta_time / self.args.substep
+        num_substeps = int(delta_time / substep_size)
+
+        frames: List[torch.Tensor] = []
+        init_frame_idx = min(frame_start, self.scene.train_frame_num - 1)
+        frames.append(
+            self._render_frame(
+                self.train_frame_verts[init_frame_idx].clone(),
+                cam,
+                cidx,
+                requires_grad=False,
+            ).cpu()
+        )
+
+        for i in range(frame_start, frame_start + segment_len):
+            mesh_x = self.wld2sim(self.train_frame_smplx[i].clone())
+            mesh_v = self.train_frame_smplx_velo[i].clone() * self.scale
+            joint_verts_v = self.train_frame_verts_velo[i, self.joint_v_idx].clone() * self.scale
+            joint_faces_v = joint_verts_v[self.new_cloth_faces[:self.num_joint_f]].mean(1).clone()
+
+            for sub in range(num_substeps):
+                mesh_x_curr = mesh_x + substep_size * sub * mesh_v
+                self.mpm_solver.p2g2p(
+                    self.mpm_model,
+                    self.mpm_state,
+                    substep_size,
+                    mesh_x=mesh_x_curr,
+                    mesh_v=mesh_v,
+                    joint_traditional_v=None,
+                    joint_verts_v=joint_verts_v,
+                    joint_faces_v=joint_faces_v,
+                    device=device,
+                )
+
+            if ((i - frame_start) + 1) % render_stride_steps == 0 or i == frame_start + segment_len - 1:
+                particle_pos = wp.to_torch(self.mpm_state.particle_x).clone()
+                cloth_verts = self.sim2wld(particle_pos[self.n_elements:])
+                verts = self.train_frame_verts[i + 1].clone()
+                verts[self.reordered_cloth_v_idx] = cloth_verts.to(verts.device)
+                frames.append(
+                    self._render_frame(verts, cam, cidx, requires_grad=False).cpu()
+                )
+
+        clip = torch.stack(frames, dim=0).permute(1, 0, 2, 3).unsqueeze(0)
+        self._restore_initial_sim_state(H=float(phi["H"]), friction=float(phi["friction"]), requires_grad=False)
+        return clip
+
+    def _rollout_segment_end_snapshot(
+        self,
+        start_snapshot: Dict[str, torch.Tensor],
+        segment_idx: int,
+        phi: Dict[str, float],
+    ) -> Dict[str, torch.Tensor]:
+        device = "cuda"
+        frame_start, frame_end = self._segment_bounds(segment_idx)
+        segment_len = max(frame_end - frame_start, 0)
+        particle_R_inv = self.compute_rest_dir_inv_from_vf(
+            torch.stack([
+                self.vertices_init_position[:, 0],
+                self.vertices_init_position[:, 1] * float(phi["H"]),
+                self.vertices_init_position[:, 2],
+            ], dim=1),
+            self.new_cloth_faces,
+        )
+
+        self.mpm_state.continue_from_torch(
+            start_snapshot["x"].clone(),
+            tensor_velocity=start_snapshot["v"].clone(),
+            tensor_d=start_snapshot["d"].clone(),
+            tensor_C=start_snapshot["C"].clone(),
+            tensor_R_inv=particle_R_inv.clone(),
+            device=device,
+            requires_grad=False,
+        )
+        self.mpm_state.set_require_grad(False)
+        self.mpm_model.set_require_grad(False)
+
+        density = torch.ones_like(self.particle_init_position[..., 0]) * float(phi["D"])
+        youngs = torch.ones_like(self.particle_init_position[..., 0]) * float(phi["E"]) * 100.0
+        self.mpm_state.reset_density(
+            density,
+            None,
+            device,
+            requires_grad=False,
+            update_mass=True,
+        )
+        self.mpm_solver.set_E_nu_from_torch(
+            self.mpm_model,
+            youngs,
+            self.poisson_ratio.detach().clone(),
+            self.gamma.detach().clone(),
+            self.kappa.detach().clone(),
+            device,
+        )
+        self.mpm_solver.prepare_mu_lam(self.mpm_model, self.mpm_state, device)
+        self._set_friction(phi["friction"])
+        self.mpm_solver.time = 0.0
+
+        delta_time = 1.0 / 25.0
+        substep_size = delta_time / self.args.substep
+        num_substeps = int(delta_time / substep_size)
+
+        for i in range(frame_start, frame_start + segment_len):
+            mesh_x = self.wld2sim(self.train_frame_smplx[i].clone())
+            mesh_v = self.train_frame_smplx_velo[i].clone() * self.scale
+            joint_verts_v = self.train_frame_verts_velo[i, self.joint_v_idx].clone() * self.scale
+            joint_faces_v = joint_verts_v[self.new_cloth_faces[:self.num_joint_f]].mean(1).clone()
+
+            for sub in range(num_substeps):
+                mesh_x_curr = mesh_x + substep_size * sub * mesh_v
+                self.mpm_solver.p2g2p(
+                    self.mpm_model,
+                    self.mpm_state,
+                    substep_size,
+                    mesh_x=mesh_x_curr,
+                    mesh_v=mesh_v,
+                    joint_traditional_v=None,
+                    joint_verts_v=joint_verts_v,
+                    joint_faces_v=joint_faces_v,
+                    device=device,
+                )
+
+        next_snapshot = self._capture_sim_snapshot()
+        self._restore_initial_sim_state(H=float(phi["H"]), friction=float(phi["friction"]), requires_grad=False)
+        return next_snapshot
+
+    def _ensure_curriculum_snapshots(self, needed_stage_idx: int) -> None:
+        while len(self.curriculum_stage_snapshots) <= needed_stage_idx:
+            prev_stage_idx = len(self.curriculum_stage_snapshots) - 1
+            phi = {
+                "D": self.torch_param["D"].item(),
+                "E": self.torch_param["E"].item(),
+                "H": self.torch_param["H"].item(),
+                "friction": self.friction_val,
+            }
+            next_snapshot = self._rollout_segment_end_snapshot(
+                self.curriculum_stage_snapshots[-1],
+                prev_stage_idx,
+                phi,
+            )
+            self.curriculum_stage_snapshots.append(next_snapshot)
+            self.curriculum_stage_initial_positions.append(
+                next_snapshot["x"].detach().cpu().numpy()
+            )
+            self._persist_curriculum_stage_positions()
+
+    def _restore_initial_sim_state(self, H: float, friction: float, requires_grad: bool = False) -> None:
+        """Restore the simulator to the rollout start state and reset solver time."""
+        device = "cuda"
+        particle_R_inv = self.compute_rest_dir_inv_from_vf(
+            torch.stack([
+                self.vertices_init_position[:, 0],
+                self.vertices_init_position[:, 1] * H,
+                self.vertices_init_position[:, 2],
+            ], dim=1),
+            self.new_cloth_faces,
+        )
+        self.mpm_state.reset_state(
+            self.n_vertices,
+            self.particle_init_position.clone(),
+            self.particle_init_dir.clone(),
+            None,
+            self.particle_init_velo.clone(),
+            tensor_R_inv=particle_R_inv.clone(),
+            device=device,
+            requires_grad=requires_grad,
+        )
+        self.mpm_state.set_require_grad(requires_grad)
+        self.mpm_model.set_require_grad(requires_grad)
+
+        density = torch.ones_like(self.particle_init_position[..., 0]) * float(self.torch_param["D"].item())
+        youngs = torch.ones_like(self.particle_init_position[..., 0]) * float(self.torch_param["E"].item()) * 100.0
+        self.mpm_state.reset_density(
+            density,
+            None,
+            device,
+            requires_grad=requires_grad,
+            update_mass=True,
+        )
+        self.mpm_solver.set_E_nu_from_torch(
+            self.mpm_model,
+            youngs,
+            self.poisson_ratio.detach().clone(),
+            self.gamma.detach().clone(),
+            self.kappa.detach().clone(),
+            device,
+        )
+        self.mpm_solver.prepare_mu_lam(self.mpm_model, self.mpm_state, device)
+        self._set_friction(friction)
+        self.mpm_solver.time = 0.0
 
     # -----------------------------------------------------------------------
     # Full-quality rendering  (matches train_material_params.eval() pipeline)
     # -----------------------------------------------------------------------
 
-    @torch.no_grad()
     def _render_frame(
         self,
         verts: torch.Tensor,
         camera,
         camera_idx: int,
+        requires_grad: bool = False,
     ) -> torch.Tensor:
         """
         Render a single frame at full quality.
@@ -327,78 +748,75 @@ class SDSPhysicsTrainer(Trainer):
         -------
         frame : [3, H, W] float tensor in [0, 1]
         """
-        # 1. Inject vertices into Gaussian model
-        self.gaussians.set_mesh_by_verts(verts)
+        context = torch.enable_grad() if requires_grad else torch.no_grad()
+        with context:
+            # 1. Inject vertices into Gaussian model
+            self.gaussians.set_mesh_by_verts(verts)
 
-        # 2. Shadow pass: shadow_net expects [1, H, W] (matches eval())
-        shadow_map = self.gaussians.shadow_net(self._ao_approx)["shadow_map"]
-        # shadow_map: [1, 1, uv_size, uv_size]
-        # uv_coord:   [1, 1, N_faces, 2]
-        shadow = F.grid_sample(
-            shadow_map,
-            self.gaussians.uv_coord,
-            mode="bilinear",
-            align_corners=False,
-        ).squeeze()[..., None][self.gaussians.binding]
-        # shadow: [N_faces, 1]
+            # 2. Shadow pass: shadow_net expects [1, H, W] (matches eval())
+            shadow_map = self.gaussians.shadow_net(self._ao_approx)["shadow_map"]
+            shadow = F.grid_sample(
+                shadow_map,
+                self.gaussians.uv_coord,
+                mode="bilinear",
+                align_corners=False,
+            ).squeeze()[..., None][self.gaussians.binding]
 
-        # 3. Shadow-modulated SH colours
-        colors_precomp = shadow * convert_SH(
-            self.gaussians.get_features,
-            camera,
-            self.gaussians,
-            self.gaussians.get_xyz,
-        )   # [N_faces, 3]
+            # 3. Shadow-modulated SH colours
+            colors_precomp = shadow * convert_SH(
+                self.gaussians.get_features,
+                camera,
+                self.gaussians,
+                self.gaussians.get_xyz,
+            )
 
-        # 4. 3DGS rasterize
-        render_pkg = render(camera, self.gaussians, self.pipe, self.bg,
-                            override_color=colors_precomp)
+            # 4. 3DGS rasterize
+            render_pkg = render(
+                camera,
+                self.gaussians,
+                self.pipe,
+                self.bg,
+                override_color=colors_precomp,
+            )
 
-        # 5. Per-camera exposure correction
-        rendering = (
-            render_pkg["render"]
-            * torch.exp(self.gaussians.cam_m[camera_idx])[:, None, None]
-            + self.gaussians.cam_c[camera_idx][:, None, None]
-        )
+            # 5. Per-camera exposure correction
+            rendering = (
+                render_pkg["render"]
+                * torch.exp(self.gaussians.cam_m[camera_idx])[:, None, None]
+                + self.gaussians.cam_c[camera_idx][:, None, None]
+            )
 
-        # 6. Mask compositing
-        rendering = rendering * render_pkg["mask"]
-        if self.scene.white_bkgd:
-            rendering = rendering + (1.0 - render_pkg["mask"])
+            # 6. Mask compositing
+            rendering = rendering * render_pkg["mask"]
+            if self.scene.white_bkgd:
+                rendering = rendering + (1.0 - render_pkg["mask"])
 
-        out = torch.cat([rendering, render_pkg["mask"]], dim=0) # [4, H, W]
-        return out.clamp(0.0, 1.0).detach()   # [4, H, W]
+            out = torch.cat([rendering, render_pkg["mask"]], dim=0).clamp(0.0, 1.0)
+            return out if requires_grad else out.detach()
 
     # -----------------------------------------------------------------------
 
     def _simulate_and_render(
         self,
-        D: torch.Tensor,
-        E: torch.Tensor,
-        H: torch.Tensor,
+        D: float,
+        E: float,
+        H: float,
         friction: float,
         cameras: list,
-        req_grad: bool = False,
-        slice_start: int = 0,
-        slice_len: int = 31,
-    ) -> Tuple[torch.Tensor, torch.Tensor]:
+        clip_starts: List[int],
+        clip_len: int,
+        requires_grad: bool = False,
+    ) -> Tuple[torch.Tensor, torch.Tensor, Dict[str, object]]:
         """
-        Run MPM simulation with params {D, E, H, friction} and render
-        each frame with the full-quality 3DGS pipeline for all given cameras.
-
-        Returns
-        -------
-        cond_video: torch.Tensor [B, 4, H, W] in [0, 1] on CPU/CUDA
-        video : torch.Tensor  [B, 4, T, H, W] in [0, 1] on CPU (if req_grad=False) or CUDA with grads
+        Run one full rollout, render all frames for the chosen cameras, then
+        slice it into a batch of fixed-length video clips.
         """
         device = "cuda"
-        context = torch.enable_grad() if req_grad else torch.no_grad()
-        
+
+        context = torch.enable_grad() if requires_grad else torch.no_grad()
         with context:
-            # 1. Update friction in all MPM mesh colliders
             self._set_friction(friction)
 
-            # 2. Reset MPM state with height scale H
             particle_R_inv = self.compute_rest_dir_inv_from_vf(
                 torch.stack([
                     self.vertices_init_position[:, 0],
@@ -415,13 +833,20 @@ class SDSPhysicsTrainer(Trainer):
                 self.particle_init_velo.clone(),
                 tensor_R_inv=particle_R_inv.clone(),
                 device=device,
-                requires_grad=req_grad,
+                requires_grad=requires_grad,
             )
+            self.mpm_state.set_require_grad(requires_grad)
+            self.mpm_model.set_require_grad(requires_grad)
 
-            # 3. Set material parameters
-            density = torch.ones_like(self.particle_init_position[..., 0]) * D
-            youngs  = torch.ones_like(self.particle_init_position[..., 0]) * E * 100.0
-            self.mpm_state.reset_density(density, None, device, update_mass=True)
+            density = torch.ones_like(self.particle_init_position[..., 0]) * float(D)
+            youngs = torch.ones_like(self.particle_init_position[..., 0]) * float(E) * 100.0
+            self.mpm_state.reset_density(
+                density,
+                None,
+                device,
+                requires_grad=requires_grad,
+                update_mass=True,
+            )
             self.mpm_solver.set_E_nu_from_torch(
                 self.mpm_model,
                 youngs,
@@ -432,29 +857,32 @@ class SDSPhysicsTrainer(Trainer):
             )
             self.mpm_solver.prepare_mu_lam(self.mpm_model, self.mpm_state, device)
 
-            # 4. Simulate frame-by-frame and render each frame
-            delta_time   = 1.0 / 25.0
-            substep_size = 1.0 / 25.0 / self.args.substep
+            delta_time = 1.0 / 25.0
+            substep_size = delta_time / self.args.substep
             num_substeps = int(delta_time / substep_size)
-            n_frames     = min(self.scene.train_frame_num - 1, slice_start + slice_len)
+            total_frames = self.scene.train_frame_num - 1
+            render_stride_steps = int(self.sds_cfg.get("clip", {}).get("frame_stride_steps", 10))
+            render_stride_steps = max(1, render_stride_steps)
 
             frames: List[List[torch.Tensor]] = [[] for _ in cameras]
-            cond_frames: List[torch.Tensor] = []
+            for cam_i, (cam, cidx) in enumerate(cameras):
+                frame0 = self._render_frame(
+                    self.train_frame_verts[0].clone(),
+                    cam,
+                    cidx,
+                    requires_grad=requires_grad,
+                )
+                frames[cam_i].append(frame0 if requires_grad else frame0.cpu())
 
-            if slice_start == 0:
-                for cam, cidx in cameras:
-                    frame_rgba = self._render_frame(self.train_frame_verts[0].clone(), cam, cidx)
-                    cond_frames.append(frame_rgba if req_grad else frame_rgba.cpu())
+            cloth_verts_seq: List[torch.Tensor] = []
+            body_verts_seq: List[torch.Tensor] = []
+            cloth_vels_seq: List[torch.Tensor] = []
 
-            for i in range(n_frames):
+            for i in range(total_frames):
                 mesh_x = self.wld2sim(self.train_frame_smplx[i].clone())
                 mesh_v = self.train_frame_smplx_velo[i].clone() * self.scale
-                joint_verts_v = (
-                    self.train_frame_verts_velo[i, self.joint_v_idx].clone() * self.scale
-                )
-                joint_faces_v = (
-                    joint_verts_v[self.new_cloth_faces[:self.num_joint_f]].mean(1).clone()
-                )
+                joint_verts_v = self.train_frame_verts_velo[i, self.joint_v_idx].clone() * self.scale
+                joint_faces_v = joint_verts_v[self.new_cloth_faces[:self.num_joint_f]].mean(1).clone()
 
                 for sub in range(num_substeps):
                     mesh_x_curr = mesh_x + substep_size * sub * mesh_v
@@ -470,31 +898,50 @@ class SDSPhysicsTrainer(Trainer):
                         device=device,
                     )
 
-                if i >= slice_start - 1:
-                    particle_pos = wp.to_torch(self.mpm_state.particle_x).clone()
-                    cloth_verts  = self.sim2wld(particle_pos[self.n_elements:])
+                particle_pos = wp.to_torch(self.mpm_state.particle_x)
+                particle_vel = wp.to_torch(self.mpm_state.particle_v)
+                if not requires_grad:
+                    particle_pos = particle_pos.clone()
+                    particle_vel = particle_vel.clone()
+                cloth_verts = self.sim2wld(particle_pos[self.n_elements:])
+                cloth_vels = particle_vel[self.n_elements:] / self.scale
 
-                    # Build full-mesh verts: GT human body + simulated cloth
+                cloth_verts_seq.append(cloth_verts if requires_grad else cloth_verts.detach().cpu())
+                cloth_vels_seq.append(cloth_vels if requires_grad else cloth_vels.detach().cpu())
+                body_verts = self.train_frame_smplx[i + 1]
+                body_verts_seq.append(body_verts if requires_grad else body_verts.detach().cpu())
+
+                if (i + 1) % render_stride_steps == 0:
                     verts = self.train_frame_verts[i + 1].clone()
-                    verts[self.reordered_cloth_v_idx] = cloth_verts
+                    verts[self.reordered_cloth_v_idx] = cloth_verts.to(verts.device)
 
-                    if i == slice_start - 1:
-                        for cam, cidx in cameras:
-                            frame_rgba = self._render_frame(verts, cam, cidx)
-                            cond_frames.append(frame_rgba if req_grad else frame_rgba.cpu())
-                    elif i >= slice_start:
-                        for c_i, (cam, cidx) in enumerate(cameras):
-                            frame_rgba = self._render_frame(verts, cam, cidx)
-                            frames[c_i].append(frame_rgba if req_grad else frame_rgba.cpu())   # [4, H, W]
+                    for c_i, (cam, cidx) in enumerate(cameras):
+                        frame = self._render_frame(verts, cam, cidx, requires_grad=requires_grad)
+                        frames[c_i].append(frame if requires_grad else frame.cpu())
 
-            # Stack: [T, 4, H, W] → permute → [4, T, H, W] for each cam, then concat
-            videos = []
-            for lst in frames:
-                videos.append(torch.stack(lst, dim=0).permute(1, 0, 2, 3).unsqueeze(0))
-            video = torch.cat(videos, dim=0)
-            
-            cond_video = torch.stack(cond_frames, dim=0)
-            return cond_video, video   # cond_video: [B, 4, H, W], video: [B, 4, T, H, W]
+            clip_batch: List[torch.Tensor] = []
+            cond_batch: List[torch.Tensor] = []
+            max_valid_start = max(len(frames[0]) - 1 - clip_len, 0)
+            n_cams = max(len(cameras), 1)
+            for clip_idx, start in enumerate(clip_starts):
+                cam_idx = clip_idx % n_cams
+                start = min(max(start, 0), max_valid_start)
+                cond_batch.append(self.cond_image if requires_grad else self.cond_image.detach().cpu())
+                clip_frames = _slice_or_pad_frames(frames[cam_idx], start + 1, clip_len)
+                clip = torch.stack(clip_frames, dim=0).permute(1, 0, 2, 3)
+                clip_batch.append(clip)
+
+            cond_video = torch.stack(cond_batch, dim=0)
+            video = torch.stack(clip_batch, dim=0)
+            sim_data = {
+                "cloth_verts_seq": cloth_verts_seq,
+                "body_verts_seq": body_verts_seq,
+                "cloth_vels_seq": cloth_vels_seq,
+            }
+            result = (cond_video, video, sim_data)
+
+        self._restore_initial_sim_state(H=float(H), friction=float(friction), requires_grad=False)
+        return result
 
     # -----------------------------------------------------------------------
     # SDS loss via Wan 5B
@@ -502,21 +949,20 @@ class SDSPhysicsTrainer(Trainer):
 
     def _compute_sds_loss(
         self,
+        cond_video: torch.Tensor,
         video: torch.Tensor,
         generator: torch.Generator,
-    ) -> float:
+        requires_grad: bool = False,
+    ) -> torch.Tensor | float:
         """
         Compute SDS (flow-prediction) loss for the given video.
 
         Parameters
         ----------
-        video     : [1, 3, T, H, W] in [0, 1] on CPU
+        cond_video: [B, 4, H, W] in [0, 1] on CPU
+        video     : [B, 4, T, H, W] in [0, 1] on CPU
         generator : torch.Generator with a fixed seed for this step.
-                    MUST be the same generator (same seed) across all
-                    perturbations within one SPSA step so that timestep t
-                    and noise ε are identical — otherwise the finite-
-                    difference gradients measure timestep randomness, not
-                    the effect of the parameter perturbation.
+                    Must be reset to the same seed for paired SPSA probes.
 
         Returns
         -------
@@ -524,6 +970,10 @@ class SDSPhysicsTrainer(Trainer):
         """
         target_res = int(self.sds_cfg.get("sds", {}).get("target_resolution", 128))
         use_mask = getattr(self.args, "use_mask", False)
+        use_attention_soft_mask = bool(
+            getattr(self.args, "use_attention_soft_mask", False)
+            or self.sds_cfg.get("sds", {}).get("use_attention_soft_mask", False)
+        )
         
         video_cuda = video[:, :3, ...].cuda()   # [B, 3, T, H, W]
         mask_cuda = video[:, 3:4, ...].cuda()   # [B, 1, T, H, W]
@@ -547,7 +997,7 @@ class SDSPhysicsTrainer(Trainer):
         
         # Conditioning image: resize to match video resolution
         cond = F.interpolate(
-            self.cond_image[:, :3, ...] if self.cond_image.ndim == 4 else self.cond_image[:3, ...].unsqueeze(0),
+            cond_video[:, :3, ...].cuda(),
             size=(target_res, target_res),
             mode="bilinear",
             align_corners=False,
@@ -569,8 +1019,15 @@ class SDSPhysicsTrainer(Trainer):
                 # slightly biased towards low noise (small t)
                 t_sampled = t_min + (t_max - t_min) * (u ** 2)
             elif bias == "clean_2":
-                # more biased
+                # more biased towards low noise
                 t_sampled = t_min + (t_max - t_min) * (u ** 3)
+            elif bias == "transition_core":
+                # Smooth center-focused warp over [0, 1]:
+                # compresses the extremes toward the middle without the sharp
+                # triangular peak from averaging uniforms.
+                centered = 2.0 * u - 1.0
+                soft_mid = 0.5 + 0.5 * torch.sign(centered) * centered.abs().pow(1.5)
+                t_sampled = t_min + (t_max - t_min) * soft_mid
             else:
                 t_sampled = t_min + (t_max - t_min) * u
             timesteps = t_sampled.long().clamp(0, timesteps_max - 1)
@@ -580,12 +1037,25 @@ class SDSPhysicsTrainer(Trainer):
                 generator=generator, device=video_cuda.device,
             ).long()
 
-        context = torch.enable_grad() if getattr(self.args, "use_adjoint", False) else torch.no_grad()
-        with context:
-            with torch.cuda.amp.autocast(dtype=torch.float16, enabled=True):
-                loss = self.wan_guidance.compute_loss(
-                    video_cuda, cond, timesteps=timesteps, generator=generator, mask_01=(mask_cuda if use_mask else None)
+        score_mask = mask_cuda if use_mask else None
+        if use_attention_soft_mask:
+            with torch.no_grad():
+                attention_mask_cuda = self.wan_guidance.build_condition_attention_mask(
+                    cond,
+                    num_frames=T_frames,
+                    height=target_res,
+                    width=target_res,
                 )
+            score_mask = attention_mask_cuda if score_mask is None else (score_mask * attention_mask_cuda)
+
+        with torch.cuda.amp.autocast(dtype=torch.float16, enabled=True):
+            loss = self.wan_guidance.compute_loss(
+                video_cuda,
+                cond,
+                timesteps=timesteps,
+                generator=generator,
+                mask_01=score_mask,
+            )
 
         if getattr(self.args, "use_consistency_reg", False):
             # Frame consistency regularization: dampen high-frequency jitter across consecutive frames
@@ -593,8 +1063,94 @@ class SDSPhysicsTrainer(Trainer):
             weight = getattr(self.args, "consistency_weight", 0.1)
             loss = loss + weight * consistency_loss
 
-        # NOTE: Return tensor without breaking computational graph if doing analytical diff
-        return loss if getattr(self.args, "use_adjoint", False) else loss.item()
+        return loss if requires_grad else float(loss.item())
+
+    def _compute_regularization_loss(
+        self,
+        sim_data: Dict[str, object],
+        friction: float,
+        requires_grad: bool = False,
+    ) -> Tuple[torch.Tensor | float, Dict[str, torch.Tensor | float]]:
+        loss_cfg = self.sds_cfg.get("loss", {})
+        sim_proxy = type(
+            "SimResultProxy",
+            (),
+            {
+                "cloth_verts_seq": sim_data["cloth_verts_seq"],
+                "body_verts_seq": sim_data["body_verts_seq"],
+                "cloth_vels_seq": sim_data["cloth_vels_seq"],
+            },
+        )()
+        regs = compute_all_regularizers(
+            sim_proxy,
+            cloth_faces=self.new_cloth_faces.detach().cpu(),
+            rest_verts=self.vertices_init_position.detach().cpu(),
+            margin=float(loss_cfg.get("penetration_margin", 0.005)),
+            max_strain=float(loss_cfg.get("max_strain", 0.30)),
+        )
+
+        weighted = {
+            "penetration": float(loss_cfg.get("lambda_penetration", 0.05)) * regs["penetration"],
+            "stretch": float(loss_cfg.get("lambda_stretch", 0.02)) * regs["stretch"],
+            "temporal_smooth": float(loss_cfg.get("lambda_temporal_smooth", 0.02)) * regs["temporal_smooth"],
+            "friction_reg": torch.zeros_like(regs["penetration"]),
+        }
+        total = sum(weighted.values())
+        if requires_grad:
+            return total, weighted
+        return float(total.item()), {k: float(v.item()) for k, v in weighted.items()}
+
+    def _evaluate_loss(
+        self,
+        phi: Dict[str, float],
+        cameras: List[Tuple],
+        clip_starts: List[int],
+        clip_len: int,
+        step_seed: int,
+        requires_grad: bool = False,
+    ) -> Tuple[torch.Tensor | float, torch.Tensor, Dict[str, torch.Tensor | float], float, float]:
+        t_sim = time.time()
+        cond_video, video, sim_data = self._simulate_and_render(
+            phi["D"], phi["E"], phi["H"], phi["friction"], cameras, clip_starts, clip_len, requires_grad=requires_grad
+        )
+        sim_dt = time.time() - t_sim
+
+        t_wan = time.time()
+        num_noise_samples = int(getattr(self.args, "num_noise_samples", self.sds_cfg.get("sds", {}).get("num_noise_samples", 4)))
+        sds_loss = None
+        sds_generator = torch.Generator(device="cuda")
+        for n in range(num_noise_samples):
+            sds_generator.manual_seed(step_seed + n * 1337)
+            loss_n = self._compute_sds_loss(cond_video, video, sds_generator, requires_grad=requires_grad)
+            sds_loss = loss_n if sds_loss is None else sds_loss + loss_n
+        sds_loss = sds_loss / max(num_noise_samples, 1)
+        wan_dt = time.time() - t_wan
+
+        loss_cfg = self.sds_cfg.get("loss", {})
+        reg_loss, reg_terms = self._compute_regularization_loss(sim_data, phi["friction"], requires_grad=requires_grad)
+        total_loss = (
+            float(loss_cfg.get("lambda_sds", 0.9)) * sds_loss
+            + float(loss_cfg.get("lambda_regularization", 0.1)) * reg_loss
+        )
+        return total_loss, video, {"sds": sds_loss, "total": total_loss, **reg_terms}, sim_dt, wan_dt
+
+    def _evaluate_autodiff_proxy_loss(
+        self,
+        phi: Dict[str, float],
+        segment_indices: List[int],
+    ) -> Tuple[float, Dict[str, float], float]:
+        raise RuntimeError(
+            "The Warp autodiff branch no longer uses GT cloth vertices. "
+            "A prior-only end-to-end differentiable objective "
+            "(Warp rollout -> GSplat render -> Wan loss -> gradients to D/E/H) "
+            "has not been implemented yet, so there is currently no valid "
+            "gradient source for the Warp-only trainer."
+        )
+
+    def _set_param_grad_from_scalar(self, key: str, grad_value: float) -> None:
+        """Assign a Warp-derived scalar gradient onto a torch parameter safely."""
+        param = self.torch_param[key]
+        param.grad = param.detach().new_tensor(float(grad_value))
 
     # -----------------------------------------------------------------------
     # Core training step  (overrides parent)
@@ -602,346 +1158,186 @@ class SDSPhysicsTrainer(Trainer):
 
     def train_one_step(self) -> None:
         """
-        One SPSA step with SDS loss from Wan 5B.
-
-        For each of 5 perturbations (base + 4 one-sided):
-          - Simulate MPM with {D±δ, E±δ, H±δ, friction±δ}
-          - Render T frames at full quality
-          - Compute Wan 5B SDS loss
-        Then finite-difference gradient + Adam/GD update.
+        One Warp autodiff optimization step using the taped proxy loss.
         """
         step_t0 = time.time()
-        
-        use_adjoint = getattr(self.args, "use_adjoint", False)
 
-        # ── Current parameter values ─────────────────────────────────────
-        D_tens   = self.torch_param["D"].cuda()
-        E_tens   = self.torch_param["E"].cuda()
-        H_tens   = self.torch_param["H"].cuda()
-        friction = self.friction_val
-        
-        D = D_tens.item()
-        E = E_tens.item()
-        H = H_tens.item()
-        
-        # Determine randomized sliding window over the timeline
-        slice_len = 31
-        max_start = max(0, (self.scene.train_frame_num - 1) - slice_len)
-        step_slice_start = random.randint(0, max_start)
-        
-        if use_adjoint:
-            D_tens.requires_grad_(True)
-            E_tens.requires_grad_(True)
-            H_tens.requires_grad_(True)
-            
-            self.optimizer.zero_grad()
-            
-            # Setup generator
-            num_cams = getattr(self.args, "num_cams", 1)
-            sampled_cams_info = random.sample(self._cameras, min(num_cams, len(self._cameras)))
-            
-            _step_seed = self.step * 10_000 + 42
-            _sds_generator = torch.Generator(device="cuda")
-            _sds_generator.manual_seed(_step_seed)
-            
-            # 1. Forward simulation WITH gradients via Warp BPTT / Adjoint
-            t_sim = time.time()
-            cond_img_tens, video = self._simulate_and_render(
-                D_tens, E_tens, H_tens, friction, sampled_cams_info, req_grad=True, slice_start=step_slice_start, slice_len=slice_len
+        optim_mode = getattr(self.args, "optim", "warp_autodiff")
+
+        D = self.torch_param["D"].item()
+        E = self.torch_param["E"].item()
+        H = self.torch_param["H"].item()
+        friction = self.torch_param["friction"].item()
+
+        num_cams = getattr(self.args, "num_cams", 1)
+        sampled_cams_info = random.sample(self._cameras, min(num_cams, len(self._cameras)))
+        camera_idx = sampled_cams_info[0][1]
+
+        phase_name, segment_indices = self._curriculum_phase(self.step)
+        needed_stage_idx = self.curriculum_num_segments if phase_name == "random_fixed_batch" else max(segment_indices)
+        self._ensure_curriculum_snapshots(needed_stage_idx)
+        clip_len = self.curriculum_clip_frames
+        num_batch_videos = len(segment_indices)
+
+        base_phi = {"D": D, "E": E, "H": H, "friction": friction}
+        print(f"\n{'='*72}")
+        print(f"  {optim_mode.upper()} PHYSICS STEP {self.step:4d} / {self.iterations}  |  camera_idx={camera_idx}")
+        print(f"{'-'*72}")
+        print(f"  Current:  D={D:.4f}  E={E*100:.1f}Pa  H={H:.4f}  friction={friction:.4f}")
+        print(f"  Phase:    {phase_name}  segments={segment_indices}")
+        print(f"  Batch:    {num_batch_videos} fixed clips x up to {clip_len} frames")
+        print(f"{'-'*72}")
+
+        if optim_mode != "warp_autodiff":
+            raise RuntimeError(
+                f"Unsupported optimization mode '{optim_mode}'. "
+                "This trainer is Warp-autodiff-only."
             )
-            self.cond_image = cond_img_tens
-            sim_dt = time.time() - t_sim
-            
-            t_wan = time.time()
-            num_noise_samples = getattr(self.args, "num_noise_samples", 1)
-            loss_tensor = 0.0
-            for n in range(num_noise_samples):
-                _sds_generator.manual_seed(_step_seed + n * 1337)
-                loss_n = self._compute_sds_loss(video, _sds_generator)
-                if n == 0:
-                    loss_tensor = loss_n
-                else:
-                    loss_tensor = loss_tensor + loss_n
-            loss_tensor = loss_tensor / num_noise_samples
-            wan_dt = time.time() - t_wan
-            
-            # 3. Analytical Differential Backprop
-            loss_tensor.backward()
-            
-            # Extrapolate analytical gradients into classical buffer slots for step logs
-            grad_D = D_tens.grad.item() if D_tens.grad is not None else 0.0
-            grad_E = E_tens.grad.item() if E_tens.grad is not None else 0.0
-            grad_H = H_tens.grad.item() if H_tens.grad is not None else 0.0
-            grad_friction = 0.0 # BPTT logic doesn't cover mesh friction trivially right now
-            base_loss = loss_tensor.item()
-            sds_losses = [base_loss]
-            sim_times = [sim_dt]
-            wan_times = [wan_dt]
-            
-            self.torch_param["D"].grad = torch.tensor(grad_D).float()
-            self.torch_param["E"].grad = torch.tensor(grad_E).float()
-            self.torch_param["H"].grad = torch.tensor(grad_H).float()
-            
-            D_tens.requires_grad_(False)
-            E_tens.requires_grad_(False)
-            H_tens.requires_grad_(False)
-            
-            self.optimizer.step()
-            self.scheduler.step()
-            
-            base_video = video[0:1].detach().cpu()
-            
-            pdD = pdE = pdH = pdf = 0.0
-            dD = dE = dH = df = 0.0
-            camera_idx = sampled_cams_info[0][1] # Use first camera for logging
-        else:
-            # ── ORIGINAL SPSA APPROXIMATION ──────────────────────────────────
 
-            # ── SPSA perturbation sizes (with optional cosine annealing) ─────
-            spsa = self.sds_cfg.get("spsa", {})
-            delta_pct = getattr(self.args, "delta_percent", 0.005)
+        self.optimizer.zero_grad(set_to_none=True)
+        for key in ("D", "E", "H", "friction"):
+            self.torch_param[key].grad = None
 
-            # Perturbation is delta_percent (e.g. 0.5%) of the base/initial value in *this* iteration
-            dD = float(max(abs(D * delta_pct), 1e-6))
-            dE = float(max(abs(E * delta_pct), 1e-6))
-            dH = float(max(abs(H * delta_pct), 1e-6))
-            
-            # Friction can occasionally be very close to 0. Handle fallback safely.
-            f_base = friction if abs(friction) > 1e-3 else 0.01
-            df = float(max(abs(f_base * delta_pct), 1e-6))
+        base_loss, proxy_grads, base_sim_dt = self._evaluate_autodiff_proxy_loss(base_phi, segment_indices)
+        base_video = None
+        base_terms = {
+            "proxy": base_loss,
+            "total": base_loss,
+            "penetration": 0.0,
+            "stretch": 0.0,
+            "temporal_smooth": 0.0,
+            "friction_reg": 0.0,
+        }
+        grad_D = proxy_grads["D"]
+        grad_E = proxy_grads["E"]
+        grad_H = proxy_grads["H"]
+        grad_friction = float(proxy_grads.get("friction", 0.0))
 
-            # Cosine annealing: shrink perturbations as training converges.
-            # factor: 1.0 at step=0 → cosine_min_factor at step=iterations-1
-            if spsa.get("cosine_decay", False):
-                progress = self.step / max(1, self.iterations - 1)
-                min_fac  = float(spsa.get("cosine_min_factor", 0.1))
-                cosine_factor = min_fac + (1.0 - min_fac) * 0.5 * (1.0 + np.cos(np.pi * progress))
-                dD *= cosine_factor
-                dE *= cosine_factor
-                dH *= cosine_factor
-                df *= cosine_factor
-            else:
-                cosine_factor = 1.0
+        if max(abs(grad_D), abs(grad_E), abs(grad_H), abs(grad_friction)) == 0.0:
+            raise RuntimeError(
+                "Warp autodiff produced zero gradients for D/E/H/friction. "
+                "Check the Warp/Torch bridge and taped simulation path."
+            )
 
-            # One-sided perturbations: base + one param nudged at a time
-            perturbations = [
-                (0.0, 0.0, 0.0, 0.0),   # [0] base
-                (dD,  0.0, 0.0, 0.0),   # [1] +D
-                (0.0, dE,  0.0, 0.0),   # [2] +E
-                (0.0, 0.0, dH,  0.0),   # [3] +H
-                (0.0, 0.0, 0.0, df),    # [4] +friction
-            ]
+        self._set_param_grad_from_scalar("D", grad_D)
+        self._set_param_grad_from_scalar("E", grad_E)
+        self._set_param_grad_from_scalar("H", grad_H)
+        self._set_param_grad_from_scalar("friction", grad_friction)
+        grad_norm = math.sqrt(
+            grad_D * grad_D + grad_E * grad_E + grad_H * grad_H + grad_friction * grad_friction
+        )
+        self.optimizer.step()
+        self.scheduler.step()
 
-            # ── Random cameras for this step ──────────────────────────────────
-            num_cams = getattr(self.args, "num_cams", 1)
-            sampled_cams_info = random.sample(self._cameras, min(num_cams, len(self._cameras)))
-            camera_idx = sampled_cams_info[0][1] # Use first camera for logging
+        base_wan_dt = 0.0
 
-            # ── Fixed generator for this step ─────────────────────────────────
-            # All 5 perturbations use the same seed so that Wan samples the
-            # same timestep t and the same noise ε.  The only source of
-            # loss difference is then the parameter perturbation itself,
-            # making finite-difference gradients meaningful.
-            _step_seed = self.step * 10_000 + 42
-            _sds_generator = torch.Generator(device="cuda")
-
-            param_ranges  = self.param_ranges
-            sds_losses:   List[float]                 = []
-            sim_times:    List[float]                 = []
-            wan_times:    List[float]                 = []
-            base_video:   Optional[torch.Tensor]      = None
-
-            # ── Console header ────────────────────────────────────────────────
-            print(f"\n{'═'*72}")
-            print(f"  SDS PHYSICS STEP {self.step:4d} / {self.iterations}"
-                  f"  │  camera_idx={camera_idx}")
-            print(f"{'─'*72}")
-            print(f"  Current:  D={D:.4f}  E={E*100:.1f}Pa  "
-                  f"H={H:.4f}  friction={friction:.4f}")
-            print(f"{'─'*72}")
-
-            # ── SPSA perturbation loop ────────────────────────────────────────
-            for idx, (pdD, pdE, pdH, pdf) in enumerate(perturbations):
-                D_  = _clamp(D + pdD,        *param_ranges["D"])
-                E_  = _clamp(E + pdE,        *param_ranges["E"])
-                H_  = _clamp(H + pdH,        *param_ranges["H"])
-                f_  = _clamp(friction + pdf, *param_ranges["friction"])
-
-                # Simulate + render
-                t_sim = time.time()
-                cond_img_tens, video = self._simulate_and_render(
-                    D_, E_, H_, f_, sampled_cams_info, req_grad=False, slice_start=step_slice_start, slice_len=slice_len
-                )
-                if idx == 0:
-                    self.cond_image = cond_img_tens # Assign canonical condition representation 
-                    
-                sim_dt = time.time() - t_sim
-                sim_times.append(sim_dt)
-
-                if idx == 0:
-                    base_video = video[0:1]   # keep for wandb gif (only one view)
-
-                # SDS loss — reset generator to same seed every perturbation
-                # so timestep t and noise ε are identical across all 5 runs
-                t_wan = time.time()
-                num_noise_samples = getattr(self.args, "num_noise_samples", 1)
-                loss_val = 0.0
-                for n in range(num_noise_samples):
-                    _sds_generator.manual_seed(_step_seed + n * 1337)
-                    loss_n = self._compute_sds_loss(video, _sds_generator)
-                    loss_val += loss_n
-                loss_val /= num_noise_samples
-                wan_dt = time.time() - t_wan
-                wan_times.append(wan_dt)
-
-                sds_losses.append(loss_val)
-
-                print(
-                    f"  perm[{idx}] dD={pdD:+.3f} dE={pdE:+.3f} "
-                    f"dH={pdH:+.4f} df={pdf:+.3f}"
-                    f" → SDS={loss_val:.6f}  sim={sim_dt:.1f}s  wan={wan_dt:.1f}s"
-                )
-
-            # ── SPSA finite-difference gradients (one-sided) ──────────────────
-            base_loss     = sds_losses[0]
-            grad_D        = (sds_losses[1] - base_loss) / dD
-            grad_E        = (sds_losses[2] - base_loss) / dE
-            grad_H        = (sds_losses[3] - base_loss) / dH
-            grad_friction = (sds_losses[4] - base_loss) / df
-
-            # ── Update D, E, H via Adam ───────────────────────────────────────
-            self.optimizer.zero_grad()
-            self.torch_param["D"].grad = torch.tensor(grad_D).float()
-            self.torch_param["E"].grad = torch.tensor(grad_E).float()
-            self.torch_param["H"].grad = torch.tensor(grad_H).float()
-            self.optimizer.step()
-            self.scheduler.step()
-
-        param_ranges  = self.param_ranges
-        # Clamp D, E, H to physical bounds
-        for key in ("D", "E", "H"):
+        param_ranges = self.param_ranges
+        for key in ("D", "E", "H", "friction"):
             lo, hi = param_ranges[key]
             self.torch_param[key].data.clamp_(lo, hi)
 
-        # ── Update friction via simple gradient descent ───────────────────
-        lr_f = float(self.sds_cfg.get("lr", {}).get("friction", 0.01))
-        self.friction_val = _clamp(
-            friction - lr_f * grad_friction,
-            self.friction_min,
-            self.friction_max,
-        )
+        self.friction_val = self.torch_param["friction"].item()
 
-        # ── Read updated values ───────────────────────────────────────────
         D_new = self.torch_param["D"].item()
         E_new = self.torch_param["E"].item()
         H_new = self.torch_param["H"].item()
         f_new = self.friction_val
 
-        # ── Rich console log ──────────────────────────────────────────────
         step_dt = time.time() - step_t0
-        print(f"{'─'*72}")
-        print(f"  Updated:  D={D_new:.4f}  E={E_new*100:.1f}Pa  "
-              f"H={H_new:.4f}  friction={f_new:.4f}")
-        print(f"  Grads:    D={grad_D:+.5f}  E={grad_E:+.5f}  "
-              f"H={grad_H:+.6f}  friction={grad_friction:+.5f}")
-        print(f"  SDS:      base={base_loss:.6f}  "
-              f"all={[f'{l:.5f}' for l in sds_losses]}")
-        print(f"  Timing:   total={step_dt:.1f}s  "
-              f"sim_avg={np.mean(sim_times):.1f}s  "
-              f"wan_avg={np.mean(wan_times):.1f}s")
-        print(f"{'═'*72}\n")
+        print(f"{'-'*72}")
+        print(f"  Updated:  D={D_new:.4f}  E={E_new*100:.1f}Pa  H={H_new:.4f}  friction={f_new:.4f}")
+        print(f"  Grads:    D={grad_D:+.5f}  E={grad_E:+.5f}  H={grad_H:+.6f}  friction={grad_friction:+.5f}  norm={grad_norm:.6f}")
+        print(f"  Proxy:    loss={base_loss:.6f}")
+        print(
+            f"  Terms:    proxy={base_terms['proxy']:.6f}  pen={base_terms['penetration']:.6f}  "
+            f"stretch={base_terms['stretch']:.6f}  temp={base_terms['temporal_smooth']:.6f}  "
+            f"freg={base_terms['friction_reg']:.6f}"
+        )
+        print(f"  Timing:   total={step_dt:.1f}s  sim={base_sim_dt:.1f}s  wan={base_wan_dt:.1f}s")
+        print(f"{'='*72}\n")
 
-        # ── Update last_params (used by parent save()) ────────────────────
         self.last_params = {
-            "D":        D_new,
-            "E":        E_new * 100,
-            "H":        H_new,
+            "D": D_new,
+            "E": E_new * 100,
+            "H": H_new,
             "friction": f_new,
-            "loss":     base_loss,
-            "step":     self.step,
+            "loss": base_loss,
+            "step": self.step,
         }
 
-        # ── Track best ────────────────────────────────────────────────────
         if base_loss < self.best_params.get("loss", float("inf")):
             self.best_params = {k: v for k, v in self.last_params.items()}
-            print(f"  ★ New best  D={D_new:.4f}  E={E_new*100:.1f}Pa  "
-                  f"H={H_new:.4f}  friction={f_new:.4f}  loss={base_loss:.6f}\n")
+            print(f"  * New best  D={D_new:.4f}  E={E_new*100:.1f}Pa  H={H_new:.4f}  friction={f_new:.4f}  loss={base_loss:.6f}\n")
 
-        # ── CSV trajectory log ────────────────────────────────────────────
         if self.accelerator.is_main_process and self._csv_writer is not None:
             self._csv_writer.writerow([
                 self.step,
                 D_new, E_new * 100, H_new, f_new,
                 base_loss,
-                sds_losses[1], sds_losses[2], sds_losses[3], sds_losses[4],
-                grad_D, grad_E, grad_H, grad_friction,
+                base_loss, base_loss, base_terms["proxy"], base_terms["temporal_smooth"],
+                grad_D, grad_E, grad_H, grad_friction, grad_norm,
                 camera_idx,
             ])
             self._csv_file.flush()
 
-        # ── WandB log ─────────────────────────────────────────────────────
         if self.use_wandb and self.accelerator.is_main_process:
             wd: Dict = {
-                # Parameters
-                "params/D":                D_new,
-                "params/E_Pa":             E_new * 100,
-                "params/H":                H_new,
-                "params/friction":         f_new,
-                # SDS losses — base + each perturbation
-                "loss/sds_base":           base_loss,
-                "loss/sds_dD":             sds_losses[1],
-                "loss/sds_dE":             sds_losses[2],
-                "loss/sds_dH":             sds_losses[3],
-                "loss/sds_dfriction":      sds_losses[4],
-                # SPSA gradients
-                "gradients/D":             grad_D,
-                "gradients/E":             grad_E,
-                "gradients/H":             grad_H,
-                "gradients/friction":      grad_friction,
-                # SPSA perturbation sizes (after cosine decay)
-                "spsa/dD":                 dD,
-                "spsa/dE":                 dE,
-                "spsa/dH":                 dH,
-                "spsa/dfriction":          df,
-                "spsa/cosine_factor":      cosine_factor,
-                # Best params so far
-                "best/D":                  float(self.best_params.get("D",        D_new)),
-                "best/E_Pa":               float(self.best_params.get("E",        E_new * 100)),
-                "best/H":                  float(self.best_params.get("H",        H_new)),
-                "best/friction":           float(self.best_params.get("friction", f_new)),
-                "best/sds_loss":           float(self.best_params.get("loss",     base_loss)),
-                "best/step":               int(  self.best_params.get("step",     self.step)),
-                # Timing
-                "timing/step_total_s":     step_dt,
-                "timing/sim_avg_s":        float(np.mean(sim_times)),
-                "timing/wan_avg_s":        float(np.mean(wan_times)),
-                # Learning rates
-                "lr/D":                    self.optimizer.param_groups[0]["lr"],
-                "lr/E":                    self.optimizer.param_groups[1]["lr"],
-                "lr/H":                    self.optimizer.param_groups[2]["lr"],
-                # Camera used this step
-                "info/camera_idx":         camera_idx,
-                "info/n_cameras":          len(self._cameras),
+                "params/D": D_new,
+                "params/E_Pa": E_new * 100,
+                "params/H": H_new,
+                "params/friction": f_new,
+                "loss/proxy_base": base_loss,
+                "loss/proxy": base_terms["proxy"],
+                "loss/reg_penetration": base_terms["penetration"],
+                "loss/reg_stretch": base_terms["stretch"],
+                "loss/reg_temporal": base_terms["temporal_smooth"],
+                "loss/reg_friction": base_terms["friction_reg"],
+                "gradients/D": grad_D,
+                "gradients/E": grad_E,
+                "gradients/H": grad_H,
+                "gradients/friction": grad_friction,
+                "gradients/norm": grad_norm,
+                "warp/taped_substeps_per_frame": int(getattr(self.args, "taped_substeps_per_frame", 4)),
+                "curriculum/phase": 0 if phase_name == "sequential" else 1,
+                "curriculum/batch_clip_count": len(segment_indices),
+                "curriculum/segment_min": min(segment_indices),
+                "curriculum/segment_max": max(segment_indices),
+                "best/D": float(self.best_params.get("D", D_new)),
+                "best/E_Pa": float(self.best_params.get("E", E_new * 100)),
+                "best/H": float(self.best_params.get("H", H_new)),
+                "best/friction": float(self.best_params.get("friction", f_new)),
+                "best/proxy_loss": float(self.best_params.get("loss", base_loss)),
+                "best/step": int(self.best_params.get("step", self.step)),
+                "timing/step_total_s": step_dt,
+                "timing/sim_s": float(base_sim_dt),
+                "timing/wan_s": float(base_wan_dt),
+                "lr/D": self.optimizer.param_groups[0]["lr"],
+                "lr/E": self.optimizer.param_groups[1]["lr"],
+                "lr/H": self.optimizer.param_groups[2]["lr"],
+                "info/camera_idx": camera_idx,
+                "info/n_cameras": len(self._cameras),
             }
 
             video_every = getattr(self.args, "video_every", 30)
-            if (self.step > 0 and self.step % video_every == 0) and base_video is not None:
-                # Log fully rendered MPM simulation as a video block (gif natively supports 4D tensor T,3,H,W or T,H,W,3)
-                v = base_video[0, :3, ...] # [3, T, H, W]
-                # rearrange to [T, 3, H, W]
-                v = v.permute(1, 0, 2, 3) 
+            if self.step > 0 and self.step % video_every == 0:
+                preview_segment_idx = int(segment_indices[0])
+                preview_video = self._render_segment_video_for_logging(
+                    base_phi,
+                    preview_segment_idx,
+                    sampled_cams_info[0],
+                )
+                v = preview_video[0, :3, ...]
+                v = v.permute(1, 0, 2, 3)
                 v_np = (v.clamp(0, 1).cpu().numpy() * 255).astype(np.uint8)
                 try:
                     wd["video/simulation_video"] = wandb.Video(v_np, fps=10, format="gif")
                 except Exception as e:
                     print(f"[SDS] Could not log wandb Video/Gif: {e}")
-                    # Fallback to images
                     T_v = v.shape[0]
                     for fi, frame_idx in enumerate([0, T_v // 2, T_v - 1]):
                         f_np = v_np[frame_idx].transpose(1, 2, 0)
                         wd[f"video/frame_{fi}"] = wandb.Image(f_np, caption=f"frame {frame_idx}")
 
-                # Multi-camera snapshots: uniformly spaced across pool
                 n_preview = min(4, len(self._cameras))
                 preview_cams = [
                     self._cameras[round(i * (len(self._cameras) - 1) / max(1, n_preview - 1))]
@@ -1075,15 +1471,23 @@ def parse_args():
     parser.add_argument("--skip_video",  action="store_true", default=False)
     parser.add_argument("--local_rank",  type=int, default=-1)
     parser.add_argument("--num_cams",  type=int, default=1, help="Number of cameras/views to render per SPSA step.")
-    parser.add_argument("--timestep_bias",  type=str, default="uniform", choices=["uniform", "clean_1", "clean_2"], help="Bias timestep sampling logic.")
+    parser.add_argument("--timestep_bias",  type=str, default="uniform", choices=["uniform", "clean_1", "clean_2", "transition_core"], help="Bias timestep sampling logic.")
     parser.add_argument("--save_every", type=int, default=50, help="Iterations between saving checkpoints.")
-    parser.add_argument("--video_every", type=int, default=50, help="Iterations between logging full videos.")
-    parser.add_argument("--delta_percent", type=float, default=0.005, help="Delta (0.5 percent = 0.005) for finite difference w.r.t initial param values.")
+    parser.add_argument("--video_every", type=int, default=100, help="Iterations between logging full videos.")
     parser.add_argument("--use_mask", action="store_true", default=False, help="Compute SDS loss only on foreground via rendered mask.")
-    parser.add_argument("--use_adjoint", action="store_true", default=False, help="Use Adjoint method (analytical backprop) instead of SPSA.")
+    parser.add_argument("--use_attention_soft_mask", action="store_true", default=False, help="Compute a no-grad soft human mask from averaged conditioning-image attention maps and apply it in the SDS score.")
+    parser.add_argument("--condition_camera_idx", type=int, default=None, help="Actual dataset camera index to use for the fixed front-facing GSplat conditioning render.")
+    parser.add_argument("--taped_substeps_per_frame", type=int, default=4, help="Number of random MPM substeps per frame to keep in Warp tape for autodiff.")
+    parser.add_argument(
+        "--optim",
+        type=str,
+        default="warp_autodiff",
+        choices=["warp_autodiff"],
+        help="Optimization method for physics parameters. Only Warp autodiff is supported.",
+    )
     parser.add_argument("--use_consistency_reg", action="store_true", default=False, help="Add temporal consistency loss to physics trajectory.")
     parser.add_argument("--consistency_weight", type=float, default=0.1, help="Weight multiplier for frame consistency regularization.")
-    parser.add_argument("--num_noise_samples", type=int, default=1, help="Number of random noise samples injected for computing expected SDS score.")
+    parser.add_argument("--num_noise_samples", type=int, default=4, help="Number of random noise samples injected for computing expected SDS score.")
 
     raw = parser.parse_args(sys.argv[1:])
     env_rank = int(os.environ.get("LOCAL_RANK", -1))
@@ -1095,7 +1499,7 @@ def parse_args():
         raw.run_eval, raw.skip_sim, raw.skip_render, raw.skip_video,
         raw.wan_ckpt_dir, raw.wan_repo_root, raw.sds_cfg,
         raw.min_friction, raw.max_friction, raw.resume_ckpt,
-        raw.num_cams, raw.timestep_bias, raw.save_every, raw.video_every, raw.delta_percent, raw.use_mask, raw.use_adjoint,
+        raw.num_cams, raw.timestep_bias, raw.save_every, raw.video_every, raw.use_mask, raw.use_attention_soft_mask, raw.condition_camera_idx, raw.taped_substeps_per_frame, raw.optim,
         raw.use_consistency_reg, raw.consistency_weight, raw.num_noise_samples,
     )
 
@@ -1110,7 +1514,7 @@ if __name__ == "__main__":
         run_eval, skip_sim, skip_render, skip_video,
         wan_ckpt_dir, wan_repo_root, sds_cfg_path,
         min_friction, max_friction, resume_ckpt,
-        num_cams, timestep_bias, save_every, video_every, delta_percent, use_mask, use_adjoint,
+        num_cams, timestep_bias, save_every, video_every, use_mask, use_attention_soft_mask, condition_camera_idx, taped_substeps_per_frame, optim_mode,
         use_consistency_reg, consistency_weight, num_noise_samples,
     ) = parse_args()
     
@@ -1118,9 +1522,12 @@ if __name__ == "__main__":
     args.timestep_bias = timestep_bias
     args.save_every = save_every
     args.video_every = video_every
-    args.delta_percent = delta_percent
     args.use_mask = use_mask
-    args.use_adjoint = use_adjoint
+    args.use_attention_soft_mask = use_attention_soft_mask
+    args.condition_camera_idx = condition_camera_idx
+    args.taped_substeps_per_frame = taped_substeps_per_frame
+    args.optim = optim_mode
+    args.use_adjoint = True
     args.use_consistency_reg = use_consistency_reg
     args.consistency_weight = consistency_weight
     args.num_noise_samples = num_noise_samples
@@ -1162,6 +1569,7 @@ if __name__ == "__main__":
     print(f"  Wan checkpoint : {wan_ckpt_dir}")
     print(f"  SDS config     : {sds_cfg_path}")
     print(f"  Iterations     : {opt.iterations}")
+    print(f"  Optimizer      : {args.optim}")
     print(f"  Substep        : {args.substep}")
     print(f"  Grid size      : {args.grid_size}")
     print(f"  Init D / E / H : {args.init_D} / {args.init_E} Pa / 1.0")
@@ -1179,3 +1587,4 @@ if __name__ == "__main__":
         trainer.eval(skip_sim, skip_render, skip_video)
     else:
         trainer.train()
+
